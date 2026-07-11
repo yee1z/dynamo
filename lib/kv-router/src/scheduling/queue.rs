@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
@@ -31,6 +31,28 @@ use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRe
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
 const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
+
+fn m1_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_M1_TRACE").is_some())
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: ts is writable and CLOCK_MONOTONIC is shared by host processes.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    debug_assert_eq!(rc, 0);
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+fn canonical_request_id(request_id: &str) -> &str {
+    request_id
+        .get(..36)
+        .filter(|prefix| uuid::Uuid::parse_str(prefix).is_ok())
+        .unwrap_or(request_id)
+}
 
 struct ClassQueueCounters {
     pending_count: AtomicUsize,
@@ -687,6 +709,31 @@ impl<
             cached_tokens: selection.cached_tokens,
             selected_worker_tiers,
         };
+
+        if m1_trace_enabled()
+            && let Some(request_id) = request.mode.request_id()
+        {
+            let tiers = &response.selected_worker_tiers;
+            let predicted_tier = if tiers.disk_blocks > tiers.host_pinned_blocks {
+                "disk"
+            } else if tiers.host_pinned_blocks > tiers.gpu_blocks {
+                "host"
+            } else if tiers.gpu_blocks > 0 {
+                "gpu"
+            } else {
+                "miss"
+            };
+            let predicted_blocks = tiers
+                .gpu_blocks
+                .max(tiers.host_pinned_blocks)
+                .max(tiers.disk_blocks);
+            tracing::info!(
+                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
+                monotonic_ns(), canonical_request_id(request_id),
+                response.best_worker.worker_id, response.best_worker.dp_rank,
+                predicted_blocks.saturating_mul(self.block_size), predicted_tier
+            );
+        }
 
         if !request.mode.is_tracked() {
             request.respond(Ok(response));

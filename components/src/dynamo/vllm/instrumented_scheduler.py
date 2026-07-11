@@ -85,6 +85,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from itertools import count
@@ -122,6 +123,7 @@ DEFAULT_FPM_PORT = 20380
 ENV_FPM_PORT = "DYN_FORWARDPASS_METRIC_PORT"
 ENV_FPM_WORKER_ID = "DYN_FPM_WORKER_ID"
 ENV_FPM_BENCHMARK_OUTPUT_PATH = "DYN_FPM_BENCHMARK_OUTPUT_PATH"
+ENV_M1_TRACE = "DYN_M1_TRACE"
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +281,7 @@ class InstrumentedScheduler(AsyncScheduler):
         self._schedule_times: deque[float] = deque()
         self._last_update_time: float = 0.0
         self._prompt_len_per_req: dict[str, int] = {}
+        self._m1_prefill_started: set[str] = set()
         self._bench_active: bool = False
         self._bench_phase: _BenchPhase = _BenchPhase.IDLE
 
@@ -384,7 +387,39 @@ class InstrumentedScheduler(AsyncScheduler):
         output = super().schedule(throttle_prefills)
         if output.total_num_scheduled_tokens > 0:
             self._schedule_times.append(time.monotonic())
+            self._emit_m1_prefill_start(output)
         return output
+
+    def _emit_m1_prefill_start(self, output: SchedulerOutput) -> None:
+        """Emit once when a request enters its first scheduled context batch."""
+        if ENV_M1_TRACE not in os.environ:
+            return
+        request_ids = [req.req_id for req in output.scheduled_new_reqs]
+        cached = output.scheduled_cached_reqs
+        request_ids.extend(
+            req_id for req_id in cached.req_ids if cached.is_context_phase(req_id)
+        )
+        for request_id in request_ids:
+            if request_id in self._m1_prefill_started:
+                continue
+            self._m1_prefill_started.add(request_id)
+            canonical_id = request_id
+            try:
+                canonical_id = str(uuid.UUID(request_id[:36]))
+            except (ValueError, AttributeError):
+                pass
+            event = {
+                "schema": 1,
+                "ts_ns": time.monotonic_ns(),
+                "request_id": canonical_id,
+                "engine_request_id": request_id,
+                "component": "vllm_scheduler",
+                "event": "prefill_start",
+                "worker_id": self._fpm_worker_id,
+                "dp_rank": self._fpm_dp_rank,
+                "scheduled_tokens": output.num_scheduled_tokens.get(request_id, 0),
+            }
+            logger.info("DYN_M1_TRACE %s", json.dumps(event, separators=(",", ":")))
 
     def shutdown(self) -> None:
         if self._bench_active and self._bench_active_req_ids:

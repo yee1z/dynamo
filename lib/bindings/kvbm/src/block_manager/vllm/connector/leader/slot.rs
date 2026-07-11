@@ -5,7 +5,7 @@ use std::{
     any::Any,
     cmp::max,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use dynamo_llm::{
@@ -25,6 +25,28 @@ use crate::block_manager::cache_stats::CacheStatsTracker;
 use crate::{get_current_cancel_token, get_current_tokio_handle};
 
 use super::*;
+
+fn m1_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_M1_TRACE").is_some())
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is writable and CLOCK_MONOTONIC is shared by host processes.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    debug_assert_eq!(rc, 0);
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+fn canonical_request_id(request_id: &str) -> &str {
+    request_id
+        .get(..36)
+        .filter(|prefix| uuid::Uuid::parse_str(prefix).is_ok())
+        .unwrap_or(request_id)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SlotError {
@@ -1063,6 +1085,14 @@ impl Slot for VllmConnectorSlot {
         // Calculate how many blocks we're querying from host/disk
         let blocks_to_lookup = &sequence_hashes[search_offset..];
 
+        if m1_trace_enabled() {
+            tracing::info!(
+                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_start\",\"num_computed_tokens\":{},\"lookup_blocks\":{}}}",
+                monotonic_ns(), canonical_request_id(&self.request_id),
+                num_computed_tokens, blocks_to_lookup.len()
+            );
+        }
+
         tracing::debug!("matching against {} block hashes", blocks_to_lookup.len());
 
         // If there are no blocks to lookup (GPU has everything), return early
@@ -1074,6 +1104,12 @@ impl Slot for VllmConnectorSlot {
             // Still mark that we performed a lookup (even though we didn't need to query)
             self.performed_cache_lookup = true;
             self.total_blocks_queried = 0;
+            if m1_trace_enabled() {
+                tracing::info!(
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":\"gpu\",\"host_blocks\":0,\"disk_blocks\":0}}",
+                    monotonic_ns(), canonical_request_id(&self.request_id), num_computed_tokens
+                );
+            }
             return Ok(());
         }
 
@@ -1136,6 +1172,14 @@ impl Slot for VllmConnectorSlot {
 
         // early exit if we did not match any blocks
         if num_matched_blocks == 0 {
+            if m1_trace_enabled() {
+                let actual_tier = if num_computed_tokens > 0 { "gpu" } else { "miss" };
+                tracing::info!(
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0}}",
+                    monotonic_ns(), canonical_request_id(&self.request_id),
+                    num_computed_tokens, actual_tier
+                );
+            }
             return Ok(());
         }
 
@@ -1161,7 +1205,26 @@ impl Slot for VllmConnectorSlot {
 
         // early exit if we need to onboard 0 blocks (after potentially dropping the last block)
         if num_new_matched_tokens == 0 {
+            if m1_trace_enabled() {
+                let actual_tier = if num_computed_tokens > 0 { "gpu" } else { "miss" };
+                tracing::info!(
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0,\"partial_prefix\":true}}",
+                    monotonic_ns(), canonical_request_id(&self.request_id),
+                    num_computed_tokens, actual_tier
+                );
+            }
             return Ok(());
+        }
+
+        let actual_tier = if !disk_blocks.is_empty() { "disk" } else { "host" };
+        if m1_trace_enabled() {
+            tracing::info!(
+                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":{},\"disk_blocks\":{},\"partial_prefix\":{}}}",
+                monotonic_ns(), canonical_request_id(&self.request_id),
+                num_computed_tokens + num_new_matched_tokens, actual_tier,
+                host_blocks.len(), disk_blocks.len(),
+                num_computed_tokens + num_new_matched_tokens < self.sequence().total_tokens()
+            );
         }
 
         self.staging_from_host = if !host_blocks.is_empty() {
@@ -1831,6 +1894,9 @@ async fn process_onboard_request(
 
     let request_id = &onboard_req.request_id;
     let operation_id = &onboard_req.operation_id;
+    let source_pool = onboard_req.src_blocks.storage_pool();
+    let block_count = onboard_req.src_blocks.len();
+    let direction = if source_pool == BlockTransferPool::Disk { "d2d" } else { "h2d" };
 
     // extract source block ids
     let src_block_ids = onboard_req.src_blocks.block_ids();
@@ -1844,7 +1910,7 @@ async fn process_onboard_request(
 
     // create transfer request
     let block_xfer_req = BlockTransferRequest {
-        from_pool: onboard_req.src_blocks.storage_pool(),
+        from_pool: source_pool,
         to_pool: BlockTransferPool::Device,
         blocks: block_pairs,
         connector_req: Some(LeaderTransferRequest {
@@ -1855,9 +1921,25 @@ async fn process_onboard_request(
         }),
     };
 
+    if m1_trace_enabled() {
+        tracing::info!(
+            "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"transfer_id\":{:?},\"component\":\"physical\",\"event\":\"transfer_start\",\"direction\":{:?},\"blocks\":{}}}",
+            monotonic_ns(), canonical_request_id(request_id),
+            operation_id.to_string(), direction, block_count
+        );
+    }
     let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
 
-    match notify_receiver.await {
+    let result = notify_receiver.await;
+    if m1_trace_enabled() {
+        let status = if result.is_ok() { "ok" } else { "error" };
+        tracing::info!(
+            "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"transfer_id\":{:?},\"component\":\"physical\",\"event\":\"transfer_end\",\"direction\":{:?},\"blocks\":{},\"status\":{:?}}}",
+            monotonic_ns(), canonical_request_id(request_id),
+            operation_id.to_string(), direction, block_count, status
+        );
+    }
+    match result {
         Ok(_) => {
             tracing::debug!("Onboarding transfer completed successfully");
         }

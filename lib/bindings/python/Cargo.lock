@@ -2146,6 +2146,7 @@ dependencies = [
  "dynamo-tokens",
  "flume",
  "indexmap 2.14.0",
+ "libc",
  "ordered-float 4.6.0",
  "parking_lot",
  "prometheus",
