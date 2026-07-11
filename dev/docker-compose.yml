@@ -18,9 +18,9 @@ services:
       # max_payload must be configured via configuration file (does not exist as a CLI flag)
       - ./nats-server.conf:/etc/nats/nats-server.conf:ro
     ports:
-      - 4222:4222
-      - 6222:6222
-      - 8222:8222  # the endpoints include /varz, /healthz, ...
+      - 4223:4222
+      - 6223:6222
+      - 8223:8222  # the endpoints include /varz, /healthz, ...
     networks:
       - server
 
@@ -29,7 +29,7 @@ services:
     environment:
       - ALLOW_NONE_AUTHENTICATION=yes
     ports:
-      - 2379:2379  # this port exposes the /metrics endpoint
-      - 2380:2380
+      - 2389:2379  # host :2389 avoids conflict with existing etcd on :2379
+      - 2390:2380
     networks:
       - server

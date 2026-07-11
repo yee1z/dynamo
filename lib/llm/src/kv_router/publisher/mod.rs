@@ -301,7 +301,7 @@ impl KvEventPublisher {
         } else {
             let stream_name = create_kv_stream_name(&component, KV_EVENT_SUBJECT);
             let nats_server = std::env::var(env_nats::NATS_SERVER)
-                .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+                .unwrap_or_else(|_| "nats://localhost:4223".to_string());
             let mut nats_queue = NatsQueue::new_without_consumer(
                 stream_name,
                 nats_server,

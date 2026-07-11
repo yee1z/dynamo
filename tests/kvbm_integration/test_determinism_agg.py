@@ -173,8 +173,8 @@ class LLMServerManager:
             {
                 "RUST_BACKTRACE": "1",
                 # DynamoConnector connection settings
-                "NATS_SERVER": "nats://localhost:4222",
-                "ETCD_ENDPOINTS": "http://localhost:2379",
+                "NATS_SERVER": "nats://localhost:4223",
+                "ETCD_ENDPOINTS": "http://localhost:2389",
                 # Enable KVBM metrics for monitoring offload/onboard
                 "DYN_KVBM_METRICS": "true",
                 "DYN_KVBM_METRICS_PORT": str(self.metrics_port),

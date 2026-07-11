@@ -287,7 +287,7 @@ fn default_server() -> String {
         return server;
     }
 
-    "nats://localhost:4222".to_string()
+    "nats://localhost:4223".to_string()
 }
 
 fn validate_nats_server(server: &str) -> Result<(), ValidationError> {
@@ -957,7 +957,7 @@ mod tests {
 
         // Set up client
         let client_options = ClientOptions::builder()
-            .server("nats://localhost:4222")
+            .server("nats://localhost:4223")
             .build()
             .expect("Failed to build client options");
 
@@ -1000,7 +1000,7 @@ mod tests {
 
         // Create unique stream name for this test
         let stream_name = format!("test-broadcast-{}", Uuid::new_v4());
-        let nats_server = "nats://localhost:4222".to_string();
+        let nats_server = "nats://localhost:4223".to_string();
         let timeout = time::Duration::from_secs(0);
 
         // Connect to NATS client first to delete stream if it exists

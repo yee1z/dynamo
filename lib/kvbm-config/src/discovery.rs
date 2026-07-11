@@ -62,7 +62,7 @@ pub struct EtcdDiscoveryConfig {
     /// Cluster ID / key prefix for discovery (required).
     pub cluster_id: String,
 
-    /// Etcd endpoints (default: ["http://localhost:2379"]).
+    /// Etcd endpoints (default: ["http://localhost:2389"]).
     #[serde(default = "default_etcd_endpoints")]
     pub endpoints: Vec<String>,
 
@@ -116,7 +116,7 @@ pub struct FilesystemDiscoveryConfig {
 }
 
 fn default_etcd_endpoints() -> Vec<String> {
-    vec!["http://localhost:2379".to_string()]
+    vec!["http://localhost:2389".to_string()]
 }
 
 fn default_etcd_ttl() -> u64 {
@@ -234,7 +234,7 @@ mod tests {
     fn test_serialize_etcd_config() {
         let config = DiscoveryConfig::Etcd(EtcdDiscoveryConfig {
             cluster_id: "my-cluster".to_string(),
-            endpoints: vec!["http://localhost:2379".to_string()],
+            endpoints: vec!["http://localhost:2389".to_string()],
             ttl_secs: 60,
             operation_timeout_secs: 30,
             max_retries: 3,
@@ -249,7 +249,7 @@ mod tests {
     fn test_etcd_default() {
         let config = EtcdDiscoveryConfig::default();
         assert!(config.cluster_id.is_empty());
-        assert_eq!(config.endpoints, vec!["http://localhost:2379"]);
+        assert_eq!(config.endpoints, vec!["http://localhost:2389"]);
         assert_eq!(config.ttl_secs, 60);
         assert_eq!(config.operation_timeout_secs, 30);
         assert_eq!(config.max_retries, 3);

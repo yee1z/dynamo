@@ -234,7 +234,7 @@ pub(crate) async fn start_kv_router_background(
     // Set up NATS connections
     let stream_name = create_kv_stream_name(&component, KV_EVENT_SUBJECT);
     let nats_server = std::env::var(env_nats::NATS_SERVER)
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        .unwrap_or_else(|_| "nats://localhost:4223".to_string());
 
     // Create NatsQueue for event consumption
     let mut nats_queue = NatsQueue::new_with_consumer(

@@ -25,7 +25,7 @@ BLOCK_SIZE = 16
 
 def _nats_server() -> str:
     # Prefer dynamically-started NATS from per-test fixtures when present.
-    return os.environ.get("NATS_SERVER", "nats://localhost:4222")
+    return os.environ.get("NATS_SERVER", "nats://localhost:4223")
 
 
 def generate_random_suffix() -> str:
