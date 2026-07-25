@@ -85,7 +85,6 @@ import os
 import queue
 import threading
 import time
-import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from itertools import count
@@ -108,6 +107,7 @@ from dynamo.common.forward_pass_metrics import (
     WelfordAccumulator,
     encode,
 )
+from dynamo.common import phase_c_nvtx
 from dynamo.runtime.logging import configure_dynamo_logging
 
 if TYPE_CHECKING:
@@ -282,6 +282,7 @@ class InstrumentedScheduler(AsyncScheduler):
         self._last_update_time: float = 0.0
         self._prompt_len_per_req: dict[str, int] = {}
         self._m1_prefill_started: set[str] = set()
+        self._phase_c_queue_ranges: dict[str, object] = {}
         self._bench_active: bool = False
         self._bench_phase: _BenchPhase = _BenchPhase.IDLE
 
@@ -326,6 +327,43 @@ class InstrumentedScheduler(AsyncScheduler):
         if self._bench_active:
             return True
         return super().has_requests()
+
+    def add_request(self, request: Request) -> None:
+        is_new = request.request_id not in self.requests
+        if is_new:
+            try:
+                canonical_id = phase_c_nvtx.canonical_uuid(request.request_id)
+                payload = phase_c_nvtx.make_payload(
+                    canonical_id, worker_id=self._fpm_worker_id
+                )
+                self._phase_c_queue_ranges[request.request_id] = (
+                    phase_c_nvtx.start_range("worker_queue", payload)
+                )
+                if ENV_M1_TRACE in os.environ:
+                    event = {
+                        "schema": 1,
+                        "ts_ns": time.monotonic_ns(),
+                        "request_id": canonical_id,
+                        "engine_request_id": request.request_id,
+                        "component": "vllm_scheduler",
+                        "event": "scheduler_enqueued",
+                        "worker_id": self._fpm_worker_id,
+                        "dp_rank": self._fpm_dp_rank,
+                        **phase_c_nvtx.trace_keys(canonical_id),
+                    }
+                    logger.info(
+                        "DYN_M1_TRACE %s",
+                        json.dumps(event, separators=(",", ":")),
+                    )
+            except ValueError:
+                pass
+        try:
+            super().add_request(request)
+        except Exception:
+            phase_c_nvtx.end_range(
+                self._phase_c_queue_ranges.pop(request.request_id, None)
+            )
+            raise
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if self._bench_active and self._bench_phase != _BenchPhase.IDLE:
@@ -392,8 +430,6 @@ class InstrumentedScheduler(AsyncScheduler):
 
     def _emit_m1_prefill_start(self, output: SchedulerOutput) -> None:
         """Emit once when a request enters its first scheduled context batch."""
-        if ENV_M1_TRACE not in os.environ:
-            return
         request_ids = [req.req_id for req in output.scheduled_new_reqs]
         cached = output.scheduled_cached_reqs
         request_ids.extend(
@@ -405,9 +441,31 @@ class InstrumentedScheduler(AsyncScheduler):
             self._m1_prefill_started.add(request_id)
             canonical_id = request_id
             try:
-                canonical_id = str(uuid.UUID(request_id[:36]))
+                canonical_id = phase_c_nvtx.canonical_uuid(request_id)
             except (ValueError, AttributeError):
                 pass
+            phase_c_nvtx.end_range(self._phase_c_queue_ranges.pop(request_id, None))
+            if ENV_M1_TRACE not in os.environ:
+                continue
+            keys = {}
+            try:
+                keys = phase_c_nvtx.trace_keys(canonical_id)
+            except ValueError:
+                pass
+            admitted = {
+                "schema": 1,
+                "ts_ns": time.monotonic_ns(),
+                "request_id": canonical_id,
+                "engine_request_id": request_id,
+                "component": "vllm_scheduler",
+                "event": "scheduler_admitted",
+                "worker_id": self._fpm_worker_id,
+                "dp_rank": self._fpm_dp_rank,
+                **keys,
+            }
+            logger.info(
+                "DYN_M1_TRACE %s", json.dumps(admitted, separators=(",", ":"))
+            )
             event = {
                 "schema": 1,
                 "ts_ns": time.monotonic_ns(),
@@ -418,6 +476,7 @@ class InstrumentedScheduler(AsyncScheduler):
                 "worker_id": self._fpm_worker_id,
                 "dp_rank": self._fpm_dp_rank,
                 "scheduled_tokens": output.num_scheduled_tokens.get(request_id, 0),
+                **keys,
             }
             logger.info("DYN_M1_TRACE %s", json.dumps(event, separators=(",", ":")))
 
@@ -428,6 +487,9 @@ class InstrumentedScheduler(AsyncScheduler):
                 len(self._bench_active_req_ids),
             )
             self._bench_cleanup_requests()
+        for range_id in self._phase_c_queue_ranges.values():
+            phase_c_nvtx.end_range(range_id)
+        self._phase_c_queue_ranges.clear()
         self._publisher.shutdown()
         super().shutdown()
 
@@ -603,6 +665,7 @@ class InstrumentedScheduler(AsyncScheduler):
     def _cleanup_finished(self, output: SchedulerOutput) -> None:
         for req_id in output.finished_req_ids:
             self._prompt_len_per_req.pop(req_id, None)
+            phase_c_nvtx.end_range(self._phase_c_queue_ranges.pop(req_id, None))
 
     # ------------------------------------------------------------------
     # Benchmark mode

@@ -10,6 +10,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+#[cfg(feature = "phase-c-nvtx")]
+use dynamo_runtime::nvtx::{
+    self, CATEGORY_ROUTER, PhaseCPayload, PhaseCRange, TIER_UNKNOWN,
+};
+
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
 use super::overlap_refresh::{
@@ -670,6 +675,19 @@ impl<
     /// Run the full scheduling pipeline for a single request:
     /// compute projected load -> select worker -> book tracked state -> respond.
     fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
+        #[cfg(feature = "phase-c-nvtx")]
+        let phase_c_router_range = request
+            .mode
+            .request_id()
+            .and_then(nvtx::request_key)
+            .map(|request_key| {
+                PhaseCRange::start(
+                    "router_match",
+                    CATEGORY_ROUTER,
+                    PhaseCPayload::new(request_key, 0, 0, TIER_UNKNOWN, 0, 0),
+                )
+            });
+
         request.worker_loads = self
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
@@ -727,6 +745,18 @@ impl<
                 .gpu_blocks
                 .max(tiers.host_pinned_blocks)
                 .max(tiers.disk_blocks);
+            #[cfg(feature = "phase-c-nvtx")]
+            {
+                let canonical_id = canonical_request_id(request_id);
+                let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+                tracing::info!(
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
+                    monotonic_ns(), canonical_id, request_key, nvtx::key_hex(request_key),
+                    response.best_worker.worker_id, response.best_worker.dp_rank,
+                    predicted_blocks.saturating_mul(self.block_size), predicted_tier
+                );
+            }
+            #[cfg(not(feature = "phase-c-nvtx"))]
             tracing::info!(
                 "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
                 monotonic_ns(), canonical_request_id(request_id),
@@ -734,6 +764,9 @@ impl<
                 predicted_blocks.saturating_mul(self.block_size), predicted_tier
             );
         }
+
+        #[cfg(feature = "phase-c-nvtx")]
+        drop(phase_c_router_range);
 
         if !request.mode.is_tracked() {
             request.respond(Ok(response));

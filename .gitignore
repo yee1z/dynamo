@@ -124,6 +124,7 @@ generated-values.yaml
 
 # Local build artifacts for devcontainer
 .build/
+/dist/
 **/.devcontainer/.env
 TensorRT-LLM
 

@@ -16,6 +16,7 @@ readme = "README.md"
 default = []
 metrics = ["dep:prometheus"]
 runtime-protocols = ["dep:dynamo-runtime"]
+phase-c-nvtx = ["runtime-protocols", "dynamo-runtime/nvtx"]
 bench = []
 profile = []
 shard-metrics = []

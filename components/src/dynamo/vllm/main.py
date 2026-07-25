@@ -548,6 +548,16 @@ def setup_vllm_engine(
             configure_gms_lock_mode(engine_args)
             configure_mx_ports(engine_args)
 
+    if os.getenv("DYN_PHASE_C_NVTX", "").lower() in {"1", "true", "yes", "on"}:
+        if engine_args.worker_cls in (None, "auto"):
+            engine_args.worker_cls = "dynamo.vllm.phase_c_worker.PhaseCWorker"
+            logger.info("Phase C NVTX: worker_cls set to PhaseCWorker")
+        elif "PhaseCWorker" not in str(engine_args.worker_cls):
+            raise ValueError(
+                "DYN_PHASE_C_NVTX requires PhaseCWorker, but worker_cls is already "
+                f"{engine_args.worker_cls!r}; use a subclass that preserves Phase C ranges"
+            )
+
     # Configure ec_both mode with DynamoMultimodalEmbeddingCacheConnector.
     # Must happen BEFORE engine setup so vLLM sees ec_transfer_config.
     if (

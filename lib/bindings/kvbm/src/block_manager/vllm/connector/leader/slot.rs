@@ -19,6 +19,11 @@ use dynamo_llm::{
     tokens::{SequenceHash, TokenBlock},
 };
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
+use dynamo_runtime::nvtx;
+#[cfg(feature = "phase-c-nvtx")]
+use dynamo_runtime::nvtx::{
+    CATEGORY_CONNECTOR, PhaseCPayload, PhaseCRange, TIER_UNKNOWN,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::block_manager::cache_stats::CacheStatsTracker;
@@ -1084,11 +1089,28 @@ impl Slot for VllmConnectorSlot {
 
         // Calculate how many blocks we're querying from host/disk
         let blocks_to_lookup = &sequence_hashes[search_offset..];
+        let request_key = nvtx::request_key(canonical_request_id(&self.request_id)).unwrap_or(0);
+        let request_key_hex = nvtx::key_hex(request_key);
+
+        #[cfg(feature = "phase-c-nvtx")]
+        let _phase_c_match_range = PhaseCRange::start(
+            "connector_match",
+            CATEGORY_CONNECTOR,
+            PhaseCPayload::new(
+                request_key,
+                0,
+                0,
+                TIER_UNKNOWN,
+                blocks_to_lookup.len() as u64,
+                blocks_to_lookup.len() as u64 * nvtx::PHASE_C_BLOCK_BYTES,
+            ),
+        );
 
         if m1_trace_enabled() {
             tracing::info!(
-                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_start\",\"num_computed_tokens\":{},\"lookup_blocks\":{}}}",
+                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_start\",\"num_computed_tokens\":{},\"lookup_blocks\":{}}}",
                 monotonic_ns(), canonical_request_id(&self.request_id),
+                request_key, request_key_hex,
                 num_computed_tokens, blocks_to_lookup.len()
             );
         }
@@ -1106,8 +1128,9 @@ impl Slot for VllmConnectorSlot {
             self.total_blocks_queried = 0;
             if m1_trace_enabled() {
                 tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":\"gpu\",\"host_blocks\":0,\"disk_blocks\":0}}",
-                    monotonic_ns(), canonical_request_id(&self.request_id), num_computed_tokens
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":\"gpu\",\"host_blocks\":0,\"disk_blocks\":0}}",
+                    monotonic_ns(), canonical_request_id(&self.request_id),
+                    request_key, request_key_hex, num_computed_tokens
                 );
             }
             return Ok(());
@@ -1175,8 +1198,9 @@ impl Slot for VllmConnectorSlot {
             if m1_trace_enabled() {
                 let actual_tier = if num_computed_tokens > 0 { "gpu" } else { "miss" };
                 tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0}}",
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0}}",
                     monotonic_ns(), canonical_request_id(&self.request_id),
+                    request_key, request_key_hex,
                     num_computed_tokens, actual_tier
                 );
             }
@@ -1208,8 +1232,9 @@ impl Slot for VllmConnectorSlot {
             if m1_trace_enabled() {
                 let actual_tier = if num_computed_tokens > 0 { "gpu" } else { "miss" };
                 tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0,\"partial_prefix\":true}}",
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0,\"partial_prefix\":true}}",
                     monotonic_ns(), canonical_request_id(&self.request_id),
+                    request_key, request_key_hex,
                     num_computed_tokens, actual_tier
                 );
             }
@@ -1219,8 +1244,9 @@ impl Slot for VllmConnectorSlot {
         let actual_tier = if !disk_blocks.is_empty() { "disk" } else { "host" };
         if m1_trace_enabled() {
             tracing::info!(
-                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":{},\"disk_blocks\":{},\"partial_prefix\":{}}}",
+                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":{},\"disk_blocks\":{},\"partial_prefix\":{}}}",
                 monotonic_ns(), canonical_request_id(&self.request_id),
+                request_key, request_key_hex,
                 num_computed_tokens + num_new_matched_tokens, actual_tier,
                 host_blocks.len(), disk_blocks.len(),
                 num_computed_tokens + num_new_matched_tokens < self.sequence().total_tokens()
@@ -1422,6 +1448,50 @@ impl VllmConnectorSlot {
         let num_blocks = src_blocks.len();
         let src_storage_pool = src_blocks.storage_pool();
         let operation_id = uuid::Uuid::new_v4();
+        let canonical_id = canonical_request_id(&self.request_id);
+        let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+        let transfer_id = operation_id.to_string();
+        let transfer_key = nvtx::transfer_key(Some(&transfer_id)).unwrap_or(0);
+        let tier_code = if src_storage_pool == BlockTransferPool::Disk {
+            nvtx::TIER_DISK
+        } else {
+            nvtx::TIER_HOST
+        };
+        let bytes = num_blocks as u64 * nvtx::PHASE_C_BLOCK_BYTES;
+
+        #[cfg(feature = "phase-c-nvtx")]
+        nvtx::phase_c_mark(
+            "onboard_submit",
+            CATEGORY_CONNECTOR,
+            PhaseCPayload::new(
+                request_key,
+                transfer_key,
+                0,
+                tier_code,
+                num_blocks as u64,
+                bytes,
+            ),
+        );
+        if m1_trace_enabled() {
+            tracing::info!(
+                "DYN_M1_TRACE {}",
+                serde_json::json!({
+                    "schema": 1,
+                    "ts_ns": monotonic_ns(),
+                    "request_id": canonical_id,
+                    "request_key": request_key,
+                    "request_key_hex": nvtx::key_hex(request_key),
+                    "transfer_id": transfer_id,
+                    "transfer_key": transfer_key,
+                    "transfer_key_hex": nvtx::key_hex(transfer_key),
+                    "component": "connector",
+                    "event": "onboard_submit",
+                    "tier_code": tier_code,
+                    "blocks": num_blocks,
+                    "bytes": bytes,
+                })
+            );
+        }
 
         let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
             self.request_id.clone(),
@@ -1922,10 +1992,14 @@ async fn process_onboard_request(
     };
 
     if m1_trace_enabled() {
+        let canonical_id = canonical_request_id(request_id);
+        let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+        let transfer_id = operation_id.to_string();
+        let transfer_key = nvtx::transfer_key(Some(&transfer_id)).unwrap_or(0);
         tracing::info!(
-            "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"transfer_id\":{:?},\"component\":\"physical\",\"event\":\"transfer_start\",\"direction\":{:?},\"blocks\":{}}}",
-            monotonic_ns(), canonical_request_id(request_id),
-            operation_id.to_string(), direction, block_count
+            "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_id\":{:?},\"transfer_key\":{},\"transfer_key_hex\":{:?},\"component\":\"physical\",\"event\":\"transfer_start\",\"direction\":{:?},\"blocks\":{}}}",
+            monotonic_ns(), canonical_id, request_key, nvtx::key_hex(request_key),
+            transfer_id, transfer_key, nvtx::key_hex(transfer_key), direction, block_count
         );
     }
     let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
@@ -1933,10 +2007,14 @@ async fn process_onboard_request(
     let result = notify_receiver.await;
     if m1_trace_enabled() {
         let status = if result.is_ok() { "ok" } else { "error" };
+        let canonical_id = canonical_request_id(request_id);
+        let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+        let transfer_id = operation_id.to_string();
+        let transfer_key = nvtx::transfer_key(Some(&transfer_id)).unwrap_or(0);
         tracing::info!(
-            "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"transfer_id\":{:?},\"component\":\"physical\",\"event\":\"transfer_end\",\"direction\":{:?},\"blocks\":{},\"status\":{:?}}}",
-            monotonic_ns(), canonical_request_id(request_id),
-            operation_id.to_string(), direction, block_count, status
+            "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_id\":{:?},\"transfer_key\":{},\"transfer_key_hex\":{:?},\"component\":\"physical\",\"event\":\"transfer_end\",\"direction\":{:?},\"blocks\":{},\"status\":{:?}}}",
+            monotonic_ns(), canonical_id, request_key, nvtx::key_hex(request_key),
+            transfer_id, transfer_key, nvtx::key_hex(transfer_key), direction, block_count, status
         );
     }
     match result {

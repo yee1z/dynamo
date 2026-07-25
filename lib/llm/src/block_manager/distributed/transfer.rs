@@ -25,7 +25,57 @@ use crate::block_manager::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, OnceLock},
+};
+
+use dynamo_runtime::nvtx::{
+    self, CATEGORY_TRANSFER, PHASE_C_BLOCK_BYTES, PhaseCPayload, PhaseCRange,
+};
+
+fn m1_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_M1_TRACE").is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_transfer_boundary(
+    event: &str,
+    request_id: &str,
+    request_key: u64,
+    transfer_id: &str,
+    transfer_key: u64,
+    direction: &str,
+    tier_code: u64,
+    blocks: u64,
+    bytes: u64,
+    status: Option<&str>,
+) {
+    if !m1_trace_enabled() {
+        return;
+    }
+    tracing::info!(
+        "DYN_M1_TRACE {}",
+        serde_json::json!({
+            "schema": 1,
+            "ts_ns": nvtx::monotonic_ns(),
+            "request_id": request_id,
+            "request_key": request_key,
+            "request_key_hex": nvtx::key_hex(request_key),
+            "transfer_id": transfer_id,
+            "transfer_key": transfer_key,
+            "transfer_key_hex": nvtx::key_hex(transfer_key),
+            "component": "physical",
+            "event": event,
+            "direction": direction,
+            "tier_code": tier_code,
+            "blocks": blocks,
+            "bytes": bytes,
+            "status": status,
+        })
+    );
+}
 
 #[cfg(feature = "nccl")]
 use cudarc::nccl::sys::ncclComm_t;
@@ -540,6 +590,38 @@ impl Handler for BlockTransferHandler {
 
         let result = if let Some(req) = request.connector_req.take() {
             let operation_id = req.uuid;
+            let canonical_request_id = nvtx::canonical_uuid(&req.request_id);
+            let trace_request_id = canonical_request_id
+                .clone()
+                .unwrap_or_else(|| req.request_id.clone());
+            let is_onboard = *request.to_pool() == Device
+                && matches!(*request.from_pool(), Host | Disk);
+            let tier_code = match *request.from_pool() {
+                Host => nvtx::TIER_HOST,
+                Disk => nvtx::TIER_DISK,
+                Device => nvtx::TIER_GPU,
+            };
+            let direction = match (*request.from_pool(), *request.to_pool()) {
+                (Host, Device) => "h2d",
+                (Disk, Device) => "d2d",
+                _ => "other",
+            };
+            let request_key = canonical_request_id
+                .as_deref()
+                .and_then(nvtx::request_key)
+                .unwrap_or(0);
+            let transfer_id = operation_id.to_string();
+            let transfer_key = nvtx::transfer_key(Some(&transfer_id)).unwrap_or(0);
+            let blocks = request.blocks().len() as u64;
+            let bytes = blocks.saturating_mul(PHASE_C_BLOCK_BYTES);
+            let payload = PhaseCPayload::new(
+                request_key,
+                transfer_key,
+                0,
+                tier_code,
+                blocks,
+                bytes,
+            );
 
             tracing::debug!(
                 request_id = %req.request_id,
@@ -553,12 +635,93 @@ impl Handler for BlockTransferHandler {
                 .expect("scheduler client is required")
                 .clone();
 
+            let queue_wait_range = is_onboard.then(|| {
+                PhaseCRange::start("transfer_queue_wait", CATEGORY_TRANSFER, payload)
+            });
+            if is_onboard {
+                emit_transfer_boundary(
+                    "transfer_enqueued",
+                    &trace_request_id,
+                    request_key,
+                    &transfer_id,
+                    transfer_key,
+                    direction,
+                    tier_code,
+                    blocks,
+                    bytes,
+                    None,
+                );
+            }
             let handle = client.schedule_transfer(req).await?;
+            drop(queue_wait_range);
+            if is_onboard {
+                emit_transfer_boundary(
+                    "transfer_dequeued",
+                    &trace_request_id,
+                    request_key,
+                    &transfer_id,
+                    transfer_key,
+                    direction,
+                    tier_code,
+                    blocks,
+                    bytes,
+                    None,
+                );
+            }
 
             // we don't support cancellation yet
             assert_eq!(handle.scheduler_decision(), SchedulingDecision::Execute);
 
-            match self.execute_transfer(request).await {
+            let dma_range = is_onboard.then(|| {
+                PhaseCRange::start(
+                    if direction == "h2d" {
+                        "h2d_transfer"
+                    } else {
+                        "d2d_transfer"
+                    },
+                    CATEGORY_TRANSFER,
+                    payload,
+                )
+            });
+            // Disk onboarding is a fused direct-storage-to-device operation in
+            // this path. Keep a disk_read range aligned with the d2d range so
+            // the source tier remains directly queryable in Nsight Systems.
+            let disk_read_range = (is_onboard && *request.from_pool() == Disk).then(|| {
+                PhaseCRange::start("disk_read", CATEGORY_TRANSFER, payload)
+            });
+            if is_onboard {
+                emit_transfer_boundary(
+                    "dma_start",
+                    &trace_request_id,
+                    request_key,
+                    &transfer_id,
+                    transfer_key,
+                    direction,
+                    tier_code,
+                    blocks,
+                    bytes,
+                    None,
+                );
+            }
+            let transfer_result = self.execute_transfer(request).await;
+            drop(disk_read_range);
+            drop(dma_range);
+            if is_onboard {
+                emit_transfer_boundary(
+                    "dma_end",
+                    &trace_request_id,
+                    request_key,
+                    &transfer_id,
+                    transfer_key,
+                    direction,
+                    tier_code,
+                    blocks,
+                    bytes,
+                    Some(if transfer_result.is_ok() { "ok" } else { "error" }),
+                );
+            }
+
+            match transfer_result {
                 Ok(_) => {
                     handle.mark_complete(Ok(())).await;
                     Ok(())
