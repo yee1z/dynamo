@@ -229,6 +229,7 @@ mod tests {
                 tier_overlap_blocks: Default::default(),
                 effective_overlap_blocks: HashMap::new(),
                 effective_cached_tokens: HashMap::new(),
+                lower_tier_state: Default::default(),
             })
         }
     }

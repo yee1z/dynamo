@@ -410,6 +410,7 @@ where
                 tier_overlap_blocks,
                 effective_overlap_blocks,
                 effective_cached_tokens,
+                lower_tier_state: Default::default(),
             },
             routing_constraints,
             router_config_override: router_config_override.cloned(),

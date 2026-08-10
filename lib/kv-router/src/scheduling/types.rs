@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::RouterConfigOverride;
 use super::filter::RoutingEligibility;
+use super::lower_tier_state::LowerTierStateView;
 use super::overlap::{OverlapSignals, SelectedWorkerTierSnapshot};
 use super::prefill_load::effective_prefill_tokens;
 pub use crate::protocols::PotentialLoad;
@@ -75,6 +76,7 @@ pub struct SchedulingResponse {
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
+    pub selected_worker_state: LowerTierStateView,
 }
 
 #[derive(Debug, Clone)]

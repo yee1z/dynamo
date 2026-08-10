@@ -4,6 +4,7 @@
 pub mod config;
 mod filter;
 mod local;
+pub mod lower_tier_state;
 pub mod overlap;
 pub mod overlap_refresh;
 pub mod policy;
@@ -16,6 +17,11 @@ pub mod selector;
 mod types;
 pub use filter::*;
 pub use local::LocalScheduler;
+pub use lower_tier_state::{
+    CacheIdentity, LowerTierApplyResult, LowerTierFallbackReason, LowerTierPredictionDisposition,
+    LowerTierStateLedger, LowerTierStateStatus, LowerTierStateUpdate, LowerTierStateView,
+    LowerTierUpdateKind, qualify_lower_tier_prediction,
+};
 pub use overlap::{
     CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals,
     SelectedWorkerTierSnapshot, SharedCacheOverlapScore, WorkerOverlapScore,

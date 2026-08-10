@@ -3,20 +3,19 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 #[cfg(feature = "phase-c-nvtx")]
-use dynamo_runtime::nvtx::{
-    self, CATEGORY_ROUTER, PhaseCPayload, PhaseCRange, TIER_UNKNOWN,
-};
+use dynamo_runtime::nvtx::{self, CATEGORY_ROUTER, PhaseCPayload, PhaseCRange, TIER_UNKNOWN};
 
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
+use super::lower_tier_state::qualify_lower_tier_prediction;
 use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
 };
@@ -42,8 +41,16 @@ fn m1_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DYN_M1_TRACE").is_some())
 }
 
+fn phase_d_state_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
+}
+
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: ts is writable and CLOCK_MONOTONIC is shared by host processes.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     debug_assert_eq!(rc, 0);
@@ -676,17 +683,18 @@ impl<
     /// compute projected load -> select worker -> book tracked state -> respond.
     fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
         #[cfg(feature = "phase-c-nvtx")]
-        let phase_c_router_range = request
-            .mode
-            .request_id()
-            .and_then(nvtx::request_key)
-            .map(|request_key| {
-                PhaseCRange::start(
-                    "router_match",
-                    CATEGORY_ROUTER,
-                    PhaseCPayload::new(request_key, 0, 0, TIER_UNKNOWN, 0, 0),
-                )
-            });
+        let phase_c_router_range =
+            request
+                .mode
+                .request_id()
+                .and_then(nvtx::request_key)
+                .map(|request_key| {
+                    PhaseCRange::start(
+                        "router_match",
+                        CATEGORY_ROUTER,
+                        PhaseCPayload::new(request_key, 0, 0, TIER_UNKNOWN, 0, 0),
+                    )
+                });
 
         request.worker_loads = self
             .slots
@@ -708,11 +716,13 @@ impl<
                     let selected_worker_tiers = request
                         .overlap
                         .selected_worker_tiers(selection.worker, config);
-                    (selection, selected_worker_tiers)
+                    let selected_worker_state =
+                        request.overlap.selected_worker_state(selection.worker);
+                    (selection, selected_worker_tiers, selected_worker_state)
                 })
         };
 
-        let (selection, selected_worker_tiers) = match selection {
+        let (selection, selected_worker_tiers, selected_worker_state) = match selection {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scheduling failed: {e}");
@@ -726,9 +736,10 @@ impl<
             effective_overlap_blocks: selection.effective_overlap_blocks,
             cached_tokens: selection.cached_tokens,
             selected_worker_tiers,
+            selected_worker_state,
         };
 
-        if m1_trace_enabled()
+        if (m1_trace_enabled() || phase_d_state_trace_enabled())
             && let Some(request_id) = request.mode.request_id()
         {
             let tiers = &response.selected_worker_tiers;
@@ -745,24 +756,96 @@ impl<
                 .gpu_blocks
                 .max(tiers.host_pinned_blocks)
                 .max(tiers.disk_blocks);
-            #[cfg(feature = "phase-c-nvtx")]
-            {
-                let canonical_id = canonical_request_id(request_id);
-                let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+            if phase_d_state_trace_enabled() {
+                let state = &response.selected_worker_state;
+                let state_version = state
+                    .version
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let state_age_ms = state
+                    .age
+                    .map(|age| age.as_millis().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let worker_epoch = state
+                    .worker_epoch
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let lower_tier_blocks = if predicted_tier == "host" || predicted_tier == "disk" {
+                    predicted_blocks
+                } else {
+                    0
+                };
+                let disposition = qualify_lower_tier_prediction(state, lower_tier_blocks as usize);
+                #[cfg(feature = "phase-c-nvtx")]
+                {
+                    let canonical_id = canonical_request_id(request_id);
+                    let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+                    tracing::info!(
+                        "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
+                        monotonic_ns(),
+                        canonical_id,
+                        request_key,
+                        nvtx::key_hex(request_key),
+                        response.best_worker.worker_id,
+                        response.best_worker.dp_rank,
+                        predicted_blocks.saturating_mul(self.block_size),
+                        predicted_blocks,
+                        predicted_tier,
+                        state.status.as_str(),
+                        state_version,
+                        state_age_ms,
+                        worker_epoch,
+                        state.confidence(),
+                        state.fallback_reason.as_str(),
+                        disposition.as_str()
+                    );
+                }
+                #[cfg(not(feature = "phase-c-nvtx"))]
                 tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
-                    monotonic_ns(), canonical_id, request_key, nvtx::key_hex(request_key),
-                    response.best_worker.worker_id, response.best_worker.dp_rank,
-                    predicted_blocks.saturating_mul(self.block_size), predicted_tier
+                    "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
+                    monotonic_ns(),
+                    canonical_request_id(request_id),
+                    response.best_worker.worker_id,
+                    response.best_worker.dp_rank,
+                    predicted_blocks.saturating_mul(self.block_size),
+                    predicted_blocks,
+                    predicted_tier,
+                    state.status.as_str(),
+                    state_version,
+                    state_age_ms,
+                    worker_epoch,
+                    state.confidence(),
+                    state.fallback_reason.as_str(),
+                    disposition.as_str()
+                );
+            } else {
+                #[cfg(feature = "phase-c-nvtx")]
+                {
+                    let canonical_id = canonical_request_id(request_id);
+                    let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+                    tracing::info!(
+                        "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
+                        monotonic_ns(),
+                        canonical_id,
+                        request_key,
+                        nvtx::key_hex(request_key),
+                        response.best_worker.worker_id,
+                        response.best_worker.dp_rank,
+                        predicted_blocks.saturating_mul(self.block_size),
+                        predicted_tier
+                    );
+                }
+                #[cfg(not(feature = "phase-c-nvtx"))]
+                tracing::info!(
+                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
+                    monotonic_ns(),
+                    canonical_request_id(request_id),
+                    response.best_worker.worker_id,
+                    response.best_worker.dp_rank,
+                    predicted_blocks.saturating_mul(self.block_size),
+                    predicted_tier
                 );
             }
-            #[cfg(not(feature = "phase-c-nvtx"))]
-            tracing::info!(
-                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_tier\":{:?}}}",
-                monotonic_ns(), canonical_request_id(request_id),
-                response.best_worker.worker_id, response.best_worker.dp_rank,
-                predicted_blocks.saturating_mul(self.block_size), predicted_tier
-            );
         }
 
         #[cfg(feature = "phase-c-nvtx")]
@@ -2479,6 +2562,7 @@ policy_classes:
                     (WorkerWithDpRank::new(0, 0), 16),
                     (WorkerWithDpRank::new(1, 0), 144),
                 ]),
+                lower_tier_state: Default::default(),
             },
         });
         let (queue, slots) =
@@ -2548,6 +2632,7 @@ policy_classes:
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks: HashMap::from([(worker, 7.0)]),
             effective_cached_tokens: HashMap::from([(worker, 56)]),
+            lower_tier_state: Default::default(),
         }));
         let (queue, slots) = make_queue_with_blocking_refresher(
             1,

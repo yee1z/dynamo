@@ -12,6 +12,7 @@ use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use super::TierOverlapBlocks;
+use super::lower_tier_state::{LowerTierFallbackReason, LowerTierStateView};
 
 #[derive(Debug, Clone, Default)]
 pub struct CacheHitEstimates {
@@ -25,6 +26,9 @@ pub struct OverlapSignals {
     pub tier_overlap_blocks: TierOverlapBlocks,
     pub effective_overlap_blocks: HashMap<WorkerWithDpRank, f64>,
     pub effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
+    /// Metadata health for prediction-only lower-tier decisions. An absent
+    /// worker is intentionally `unknown`, never a verified miss.
+    pub lower_tier_state: FxHashMap<WorkerWithDpRank, LowerTierStateView>,
 }
 
 impl OverlapSignals {
@@ -105,6 +109,15 @@ impl OverlapSignals {
             disk_blocks,
         }
     }
+
+    pub fn selected_worker_state(&self, worker: WorkerWithDpRank) -> LowerTierStateView {
+        self.lower_tier_state
+            .get(&worker)
+            .cloned()
+            .unwrap_or_else(|| {
+                LowerTierStateView::unknown(LowerTierFallbackReason::AwaitingInitialSnapshot)
+            })
+    }
 }
 
 /// Raw selected-worker overlap from the exact inputs used for final scheduling.
@@ -143,6 +156,7 @@ impl<'a> OverlapAnalysis<'a> {
             tier_overlap_blocks: tier_overlap_blocks_from_tiered_matches(self.tiered),
             effective_overlap_blocks: estimates.effective_overlap_blocks.into_iter().collect(),
             effective_cached_tokens: estimates.cached_tokens.into_iter().collect(),
+            lower_tier_state: FxHashMap::default(),
         }
     }
 
@@ -393,6 +407,9 @@ mod tests {
 
     use crate::indexer::{LowerTierMatchDetails, MatchDetails};
     use crate::protocols::{OverlapScores, SharedCacheHits, WorkerWithDpRank};
+    use crate::scheduling::{
+        LowerTierFallbackReason, LowerTierStateStatus, LowerTierStateView,
+    };
     use crate::test_utils::SimpleWorkerConfig;
 
     #[test]
@@ -507,5 +524,28 @@ mod tests {
         assert_eq!(snapshot.gpu_blocks, u32::MAX);
         assert_eq!(snapshot.host_pinned_blocks, u32::MAX);
         assert_eq!(snapshot.disk_blocks, u32::MAX);
+    }
+
+    #[test]
+    fn selected_worker_state_is_fail_closed_until_explicitly_attached() {
+        let worker = WorkerWithDpRank::new(4, 0);
+        let mut signals = OverlapSignals::default();
+
+        let unknown = signals.selected_worker_state(worker);
+        assert_eq!(unknown.status, LowerTierStateStatus::Unknown);
+        assert_eq!(
+            unknown.fallback_reason,
+            LowerTierFallbackReason::AwaitingInitialSnapshot
+        );
+
+        let known = LowerTierStateView {
+            status: LowerTierStateStatus::Known,
+            version: Some(12),
+            age: Some(std::time::Duration::from_millis(3)),
+            worker_epoch: Some(2),
+            fallback_reason: LowerTierFallbackReason::None,
+        };
+        signals.lower_tier_state.insert(worker, known.clone());
+        assert_eq!(signals.selected_worker_state(worker), known);
     }
 }
