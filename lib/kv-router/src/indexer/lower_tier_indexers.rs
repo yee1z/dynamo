@@ -232,11 +232,26 @@ pub fn query_lower_tiers(
             "Queried lower-tier indexer"
         );
         if phase_d_state_trace_enabled() {
+            let first_continuation = continuations.iter().next();
+            let continuation_worker_id = first_continuation.map(|(worker, _)| worker.worker_id);
+            let continuation_dp_rank = first_continuation.map(|(worker, _)| worker.dp_rank);
+            let continuation_position = first_continuation.map(|(_, state)| state.start_pos);
+            let continuation_parent_hash = first_continuation
+                .and_then(|(_, state)| state.last_matched_hash)
+                .map(|hash| hash.0);
+            let continuation_local_hash = first_continuation
+                .and_then(|(_, state)| sequence.get(state.start_pos))
+                .map(|hash| hash.0);
             tracing::info!(
                 ?storage_tier,
                 queried_workers = continuations.len(),
                 matched_workers,
                 max_extension_blocks = tier_matches.hits.values().copied().max().unwrap_or(0),
+                ?continuation_worker_id,
+                ?continuation_dp_rank,
+                ?continuation_position,
+                ?continuation_parent_hash,
+                ?continuation_local_hash,
                 "DYN_PHASE_D_LOWER_QUERY"
             );
         }

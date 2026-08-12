@@ -8,6 +8,15 @@ use super::block::registry::RegistrationHandle;
 use crate::block_manager::kv_consolidator::EventSource;
 use crate::block_manager::kv_consolidator::KvEventConsolidator;
 
+fn phase_d_local_hash(handle: &RegistrationHandle) -> u64 {
+    let bytes: Vec<u8> = handle
+        .tokens()
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    dynamo_kv_router::protocols::compute_block_hash(&bytes).0
+}
+
 fn phase_d_state_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
@@ -205,8 +214,10 @@ impl DynamoEventManager {
                     "tier": format!("{:?}", first.storage_tier()),
                     "first_hash": first.published_sequence_hash(),
                     "first_parent_hash": first.published_parent_sequence_hash(),
+                    "first_local_hash": phase_d_local_hash(first),
                     "last_hash": last.published_sequence_hash(),
                     "last_parent_hash": last.published_parent_sequence_hash(),
+                    "last_local_hash": phase_d_local_hash(last),
                 })
             );
         }
@@ -269,6 +280,17 @@ impl DynamoEventManager {
     fn publish_remove_event(&self, registration_handle: &RegistrationHandle) {
         let block_hash = registration_handle.published_sequence_hash().to_string();
         let tier = registration_handle.storage_tier();
+
+        if phase_d_state_trace_enabled() {
+            tracing::info!(
+                "DYN_PHASE_D_KVBM_REMOVE {}",
+                serde_json::json!({
+                    "schema": 1,
+                    "hash": registration_handle.published_sequence_hash(),
+                    "tier": format!("{:?}", tier),
+                })
+            );
+        }
 
         tracing::debug!(
             %block_hash,
