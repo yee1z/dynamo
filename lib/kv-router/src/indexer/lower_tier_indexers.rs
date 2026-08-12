@@ -15,13 +15,18 @@
 //! so tier semantics stay aligned across the two surfaces.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::indexer::{
     KvIndexerMetrics, LowerTierContinuation, LowerTierIndexer, LowerTierMatchDetails, MatchDetails,
     ThreadPoolIndexer, WireTieredMatchDetails,
 };
 use crate::protocols::{LocalBlockHash, StorageTier};
+
+fn phase_d_state_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
+}
 
 /// Holds one per-tier [`ThreadPoolIndexer<LowerTierIndexer>`] for every
 /// non-device [`StorageTier`] that has received at least one event.
@@ -226,6 +231,15 @@ pub fn query_lower_tiers(
             matched_workers,
             "Queried lower-tier indexer"
         );
+        if phase_d_state_trace_enabled() {
+            tracing::info!(
+                ?storage_tier,
+                queried_workers = continuations.len(),
+                matched_workers,
+                max_extension_blocks = tier_matches.hits.values().copied().max().unwrap_or(0),
+                "DYN_PHASE_D_LOWER_QUERY"
+            );
+        }
         continuations = tier_matches.next_continuations.clone();
         lower_tier_matches.insert(storage_tier, tier_matches);
     }

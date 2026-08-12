@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::block::registry::RegistrationHandle;
 
 use crate::block_manager::kv_consolidator::EventSource;
 use crate::block_manager::kv_consolidator::KvEventConsolidator;
+
+fn phase_d_state_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
+}
 
 /// The [EventManager] is not responsible for managing the history of the blocks, nor what
 /// events have been published.
@@ -187,6 +192,23 @@ impl DynamoEventManager {
     fn publish_store_events(&self, handles: Vec<Arc<RegistrationHandle>>) {
         if handles.is_empty() {
             return;
+        }
+
+        if phase_d_state_trace_enabled() {
+            let first = &handles[0];
+            let last = handles.last().expect("non-empty handles");
+            tracing::info!(
+                "DYN_PHASE_D_KVBM_STORE {}",
+                serde_json::json!({
+                    "schema": 1,
+                    "blocks": handles.len(),
+                    "tier": format!("{:?}", first.storage_tier()),
+                    "first_hash": first.published_sequence_hash(),
+                    "first_parent_hash": first.published_parent_sequence_hash(),
+                    "last_hash": last.published_sequence_hash(),
+                    "last_parent_hash": last.published_parent_sequence_hash(),
+                })
+            );
         }
 
         tracing::debug!(
