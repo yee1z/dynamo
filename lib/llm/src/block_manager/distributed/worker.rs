@@ -103,6 +103,25 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
     Ok(agent)
 }
 
+fn resolve_disk_gds(disk_enabled: bool, configured: Option<&str>) -> anyhow::Result<bool> {
+    if !disk_enabled {
+        return Ok(false);
+    }
+    configured
+        .map(dynamo_runtime::config::parse_bool)
+        .transpose()
+        .map(|value| value.unwrap_or(true))
+}
+
+fn disk_gds_enabled(disk_enabled: bool) -> anyhow::Result<bool> {
+    let configured = match std::env::var("DYN_KVBM_NIXL_BACKEND_GDS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    resolve_disk_gds(disk_enabled, configured.as_deref())
+}
+
 // Helper: perform allocation and build transfer handler (factored from previous code)
 async fn perform_allocation_and_build_handler(
     device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage>>,
@@ -131,7 +150,7 @@ async fn perform_allocation_and_build_handler(
 
     // Only create NIXL agent if we need disk blocks AND we should allocate
     let need_disk = should_allocate_offload && leader_meta.num_disk_blocks > 0;
-    let agent = build_agent(worker_id, need_disk)?;
+    let agent = build_agent(worker_id, disk_gds_enabled(need_disk)?)?;
     let pool_config = PoolConfig {
         enable_pool: true,
         max_concurrent_transfers: max_concurrent_transfers(),
@@ -881,6 +900,15 @@ mod tests {
             .num_device_blocks(1)
             .build()
             .expect("base config should build")
+    }
+
+    #[test]
+    fn disk_gds_can_be_disabled_for_posix_fallback() {
+        assert!(resolve_disk_gds(true, None).unwrap());
+        assert!(resolve_disk_gds(true, Some("true")).unwrap());
+        assert!(!resolve_disk_gds(true, Some("false")).unwrap());
+        assert!(!resolve_disk_gds(false, Some("true")).unwrap());
+        assert!(resolve_disk_gds(true, Some("invalid")).is_err());
     }
 
     // --- outer_dim ---
