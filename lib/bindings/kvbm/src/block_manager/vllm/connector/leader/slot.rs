@@ -577,6 +577,22 @@ impl VllmConnectorSlot {
         Ok(())
     }
 
+    fn router_text_sequence_hashes(&self) -> Vec<SequenceHash> {
+        let mut sequence_hashes = Vec::with_capacity(self.sequence.blocks().len());
+        for block in self.sequence.blocks() {
+            let mut bytes = Vec::with_capacity(block.tokens().len() * size_of::<u32>());
+            for token in block.tokens().iter() {
+                bytes.extend_from_slice(&token.to_le_bytes());
+            }
+            let block_hash = compute_hash_v2(&bytes, ROUTER_HASH_SEED);
+            let sequence_hash = sequence_hashes.last().copied().map_or(block_hash, |parent| {
+                next_router_sequence_hash(parent, block_hash)
+            });
+            sequence_hashes.push(sequence_hash);
+        }
+        sequence_hashes
+    }
+
     fn matched_block_ids(&self, actual_matched_blocks: usize) -> Vec<SequenceHash> {
         let blocks = self.sequence.blocks();
         // Framework-supplied hashes carry adapter and multimodal identity and
@@ -595,19 +611,10 @@ impl VllmConnectorSlot {
                 .collect();
         }
 
-        let mut sequence_hashes = Vec::with_capacity(actual_matched_blocks);
-        for block in blocks.iter().take(actual_matched_blocks) {
-            let mut bytes = Vec::with_capacity(block.tokens().len() * size_of::<u32>());
-            for token in block.tokens().iter() {
-                bytes.extend_from_slice(&token.to_le_bytes());
-            }
-            let block_hash = compute_hash_v2(&bytes, ROUTER_HASH_SEED);
-            let sequence_hash = sequence_hashes.last().copied().map_or(block_hash, |parent| {
-                next_router_sequence_hash(parent, block_hash)
-            });
-            sequence_hashes.push(sequence_hash);
-        }
-        sequence_hashes
+        self.router_text_sequence_hashes()
+            .into_iter()
+            .take(actual_matched_blocks)
+            .collect()
     }
 
     fn claim_connector_actual_trace(&mut self) -> bool {
@@ -830,9 +837,20 @@ impl Slot for VllmConnectorSlot {
             self.state = SlotState::Prefilling;
         }
 
-        if let Some(external_sequence_hashes) = external_sequence_hashes {
-            self.sync_external_sequence_hashes(external_sequence_hashes)?;
-        }
+        // TRT-LLM supplies its cumulative sequence hashes explicitly. vLLM's
+        // text path does not, so derive the router's canonical hash chain from
+        // the same completed token blocks. Publishing that chain with KVBM
+        // tier events keeps a GPU continuation connected when the next block
+        // lives in host or disk.
+        let derived_sequence_hashes;
+        let external_sequence_hashes = match external_sequence_hashes {
+            Some(hashes) => hashes,
+            None => {
+                derived_sequence_hashes = self.router_text_sequence_hashes();
+                &derived_sequence_hashes
+            }
+        };
+        self.sync_external_sequence_hashes(external_sequence_hashes)?;
 
         // Use max to advance both current_position and evaluated_blocks at least by num_computed_tokens.
         // This logic is to prevent redundant block offloading.
@@ -1049,10 +1067,8 @@ impl Slot for VllmConnectorSlot {
                     .copied()
                     .collect();
 
-                if external_sequence_hashes.is_some() {
-                    for block in &offload_token_blocks {
-                        block.assert_external_hashes_assigned();
-                    }
+                for block in &offload_token_blocks {
+                    block.assert_external_hashes_assigned();
                 }
 
                 self.offload_blocks(
@@ -2343,8 +2359,9 @@ mod connector_tests {
     }
 
     #[test]
-    fn test_matched_block_ids_fall_back_to_router_text_hashes() {
-        let (slot, _rx) = create_test_slot(96, 0);
+    fn test_vllm_text_hashes_become_the_external_block_chain() {
+        let (mut slot, _rx) = create_test_slot(96, 0);
+        let blocks = block_ids(100, 3);
         let mut expected = Vec::new();
         for block in slot.sequence.blocks().iter().take(2) {
             let mut bytes = Vec::new();
@@ -2357,6 +2374,20 @@ mod connector_tests {
             }));
         }
 
+        slot.apply_scheduler_output(&[], &blocks, 0, 96, None, None)
+            .unwrap();
+        assert_eq!(
+            slot.sequence.blocks()[0].external_sequence_hash(),
+            Some(expected[0])
+        );
+        assert_eq!(
+            slot.sequence.blocks()[1].external_parent_sequence_hash(),
+            Some(expected[0])
+        );
+        assert_eq!(
+            slot.sequence.blocks()[1].external_sequence_hash(),
+            Some(expected[1])
+        );
         assert_eq!(slot.matched_block_ids(2), expected);
     }
 
