@@ -5,6 +5,7 @@ use std::{
     any::Any,
     cmp::max,
     collections::{HashMap, HashSet},
+    mem::size_of,
     sync::{Arc, OnceLock},
 };
 
@@ -16,10 +17,10 @@ use dynamo_llm::{
         connector::protocol::{LeaderTransferRequest, RequestType, TransferType},
         distributed::{BlockTransferPool, BlockTransferRequest, KvbmLeader},
     },
-    tokens::{SequenceHash, TokenBlock},
+    tokens::{SequenceHash, TokenBlock, compute_hash_v2},
 };
-use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use dynamo_runtime::nvtx;
+use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 #[cfg(feature = "phase-c-nvtx")]
 use dynamo_runtime::nvtx::{
     CATEGORY_CONNECTOR, PhaseCPayload, PhaseCRange, TIER_UNKNOWN,
@@ -30,6 +31,15 @@ use crate::block_manager::cache_stats::CacheStatsTracker;
 use crate::{get_current_cancel_token, get_current_tokio_handle};
 
 use super::*;
+
+const ROUTER_HASH_SEED: u64 = 1337;
+
+fn next_router_sequence_hash(parent: SequenceHash, block_hash: u64) -> SequenceHash {
+    let mut bytes = [0_u8; size_of::<u64>() * 2];
+    bytes[..8].copy_from_slice(&parent.to_le_bytes());
+    bytes[8..].copy_from_slice(&block_hash.to_le_bytes());
+    compute_hash_v2(&bytes, ROUTER_HASH_SEED)
+}
 
 fn m1_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -561,16 +571,36 @@ impl VllmConnectorSlot {
     }
 
     fn matched_block_ids(&self, actual_matched_blocks: usize) -> Vec<SequenceHash> {
-        self.sequence
-            .blocks()
+        let blocks = self.sequence.blocks();
+        // Framework-supplied hashes carry adapter and multimodal identity and
+        // therefore always win. The vLLM text/base-model path does not supply
+        // them, so reconstruct the router's canonical token hash chain instead
+        // of exposing KVBM's independently salted internal identity.
+        if blocks
             .iter()
             .take(actual_matched_blocks)
-            .map(|block| {
-                block
-                    .external_sequence_hash()
-                    .unwrap_or_else(|| block.sequence_hash())
-            })
-            .collect()
+            .all(|block| block.external_sequence_hash().is_some())
+        {
+            return blocks
+                .iter()
+                .take(actual_matched_blocks)
+                .filter_map(|block| block.external_sequence_hash())
+                .collect();
+        }
+
+        let mut sequence_hashes = Vec::with_capacity(actual_matched_blocks);
+        for block in blocks.iter().take(actual_matched_blocks) {
+            let mut bytes = Vec::with_capacity(block.tokens().len() * size_of::<u32>());
+            for token in block.tokens().iter() {
+                bytes.extend_from_slice(&token.to_le_bytes());
+            }
+            let block_hash = compute_hash_v2(&bytes, ROUTER_HASH_SEED);
+            let sequence_hash = sequence_hashes.last().copied().map_or(block_hash, |parent| {
+                next_router_sequence_hash(parent, block_hash)
+            });
+            sequence_hashes.push(sequence_hash);
+        }
+        sequence_hashes
     }
 
     fn emit_connector_match_end(
@@ -2298,17 +2328,42 @@ mod connector_tests {
     }
 
     #[test]
-    fn test_matched_block_ids_fall_back_to_internal_hashes() {
+    fn test_matched_block_ids_fall_back_to_router_text_hashes() {
         let (slot, _rx) = create_test_slot(96, 0);
-        let expected = slot
-            .sequence
-            .blocks()
-            .iter()
-            .take(2)
-            .map(|block| block.sequence_hash())
-            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        for block in slot.sequence.blocks().iter().take(2) {
+            let mut bytes = Vec::new();
+            for token in block.tokens().iter() {
+                bytes.extend_from_slice(&token.to_le_bytes());
+            }
+            let local = compute_hash_v2(&bytes, ROUTER_HASH_SEED);
+            expected.push(expected.last().copied().map_or(local, |parent| {
+                next_router_sequence_hash(parent, local)
+            }));
+        }
 
         assert_eq!(slot.matched_block_ids(2), expected);
+    }
+
+    #[test]
+    fn test_router_text_hash_fallback_matches_protocol_known_vector() {
+        let first = [1_u32, 2, 3, 4]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let second = [5_u32, 6, 7, 8]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let first_hash = compute_hash_v2(&first, ROUTER_HASH_SEED);
+        let second_hash = compute_hash_v2(&second, ROUTER_HASH_SEED);
+        assert_eq!(first_hash, 14_643_705_804_678_351_452);
+        assert_eq!(second_hash, 16_777_012_769_546_811_212);
+        assert_eq!(
+            next_router_sequence_hash(first_hash, second_hash),
+            4_945_711_292_740_353_085
+        );
     }
 
     #[test]

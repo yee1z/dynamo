@@ -66,6 +66,24 @@ fn canonical_request_id(request_id: &str) -> &str {
         .unwrap_or(request_id)
 }
 
+fn phase_d_prediction(
+    tiers: &super::overlap::SelectedWorkerTierSnapshot,
+    max_reusable_blocks: u32,
+) -> (&'static str, u32) {
+    let gpu = tiers.gpu_blocks.min(max_reusable_blocks);
+    let host = tiers.host_pinned_blocks.min(max_reusable_blocks);
+    let disk = tiers.disk_blocks.min(max_reusable_blocks);
+    if disk > host {
+        ("disk", disk)
+    } else if host > gpu {
+        ("host", host)
+    } else if gpu > 0 {
+        ("gpu", gpu)
+    } else {
+        ("miss", 0)
+    }
+}
+
 struct ClassQueueCounters {
     pending_count: AtomicUsize,
     pending_isl_tokens: AtomicUsize,
@@ -744,19 +762,16 @@ impl<
             && let Some(request_id) = request.mode.request_id()
         {
             let tiers = &response.selected_worker_tiers;
-            let predicted_tier = if tiers.disk_blocks > tiers.host_pinned_blocks {
-                "disk"
-            } else if tiers.host_pinned_blocks > tiers.gpu_blocks {
-                "host"
-            } else if tiers.gpu_blocks > 0 {
-                "gpu"
-            } else {
-                "miss"
-            };
-            let predicted_blocks = tiers
-                .gpu_blocks
-                .max(tiers.host_pinned_blocks)
-                .max(tiers.disk_blocks);
+            // vLLM must compute at least one prompt token, so a fully cached
+            // block-aligned prompt drops its final block at request time.
+            let max_reusable_blocks = request
+                .isl_tokens
+                .saturating_sub(1)
+                .checked_div(self.block_size as usize)
+                .unwrap_or(0);
+            let max_reusable_blocks = u32::try_from(max_reusable_blocks).unwrap_or(u32::MAX);
+            let (predicted_tier, predicted_blocks) =
+                phase_d_prediction(tiers, max_reusable_blocks);
             if phase_d_state_trace_enabled() {
                 let state = &response.selected_worker_state;
                 let state_version = state
@@ -1061,6 +1076,26 @@ mod tests {
 
     fn decay_now() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn phase_d_prediction_caps_the_runtime_reusable_prefix() {
+        let tiers = super::super::overlap::SelectedWorkerTierSnapshot {
+            dp_device_blocks: vec![],
+            gpu_blocks: 0,
+            host_pinned_blocks: 2,
+            disk_blocks: 4,
+        };
+        assert_eq!(phase_d_prediction(&tiers, 3), ("disk", 3));
+
+        let gpu = super::super::overlap::SelectedWorkerTierSnapshot {
+            dp_device_blocks: vec![],
+            gpu_blocks: 4,
+            host_pinned_blocks: 4,
+            disk_blocks: 4,
+        };
+        assert_eq!(phase_d_prediction(&gpu, 3), ("gpu", 3));
+        assert_eq!(phase_d_prediction(&gpu, 0), ("miss", 0));
     }
 
     struct FixedPrefillLoadEstimator {
