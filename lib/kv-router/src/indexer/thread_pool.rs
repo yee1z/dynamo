@@ -624,8 +624,14 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
             self.num_workers,
         );
 
-        // Send event to the assigned worker thread
-        if let Err(e) = self.worker_event_channels[thread_idx].send(WorkerTask::Event(event)) {
+        // State consumers treat completion of this async method as the event's
+        // visibility boundary, so wait for the worker to apply it rather than
+        // returning after enqueue.
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if let Err(e) = self.worker_event_channels[thread_idx].send(WorkerTask::EventWithAck {
+            event,
+            resp: resp_tx,
+        }) {
             tracing::error!(
                 "Failed to send event to worker thread {}: {:?}",
                 thread_idx,
@@ -634,7 +640,18 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
             return;
         }
 
-        self.maybe_enqueue_cleanup(thread_idx);
+        match resp_rx.await {
+            Ok(true) => self.maybe_enqueue_cleanup(thread_idx),
+            Ok(false) => tracing::warn!(
+                "Worker thread {} rejected an index event",
+                thread_idx
+            ),
+            Err(e) => tracing::error!(
+                "Worker thread {} dropped an index event acknowledgment: {:?}",
+                thread_idx,
+                e
+            ),
+        }
     }
 
     async fn remove_worker(&self, worker_id: WorkerId) {
@@ -812,6 +829,57 @@ mod tests {
         ConcurrentRadixTreeCompressed,
         test_utils::{assert_score, make_store_event},
     };
+    use std::{
+        sync::{atomic::AtomicBool, Condvar},
+        time::Duration,
+    };
+
+    struct GatedIndexer {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        event_applied: AtomicBool,
+    }
+
+    impl SyncIndexer for GatedIndexer {
+        fn worker(
+            &self,
+            event_receiver: flume::Receiver<WorkerTask>,
+            _metrics: Option<Arc<KvIndexerMetrics>>,
+        ) -> anyhow::Result<()> {
+            while let Ok(task) = event_receiver.recv() {
+                match task {
+                    WorkerTask::Event(_) => {
+                        let (lock, ready) = &*self.gate;
+                        let mut released = lock.lock().expect("gate mutex poisoned");
+                        while !*released {
+                            released = ready.wait(released).expect("gate mutex poisoned");
+                        }
+                        self.event_applied
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    WorkerTask::EventWithAck { resp, .. } => {
+                        let (lock, ready) = &*self.gate;
+                        let mut released = lock.lock().expect("gate mutex poisoned");
+                        while !*released {
+                            released = ready.wait(released).expect("gate mutex poisoned");
+                        }
+                        self.event_applied
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        let _ = resp.send(true);
+                    }
+                    WorkerTask::Terminate => break,
+                    WorkerTask::Flush(resp) => {
+                        let _ = resp.send(());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+
+        fn find_matches(&self, _sequence: &[LocalBlockHash], _early_exit: bool) -> OverlapScores {
+            OverlapScores::default()
+        }
+    }
 
     fn assigned_thread(
         indexer: &ThreadPoolIndexer<ConcurrentRadixTreeCompressed>,
@@ -853,5 +921,50 @@ mod tests {
     #[tokio::test]
     async fn cold_rank_remove_reserves_sticky_queue() {
         assert_cold_remove_reserves_sticky_queue(ColdRemoval::DpRank).await;
+    }
+
+    #[tokio::test]
+    async fn apply_event_waits_until_the_worker_applies_it() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let indexer = Arc::new(ThreadPoolIndexer::new(
+            GatedIndexer {
+                gate: Arc::clone(&gate),
+                event_applied: AtomicBool::new(false),
+            },
+            1,
+            16,
+        ));
+        let task_indexer = Arc::clone(&indexer);
+        let mut apply_task = tokio::spawn(async move {
+            task_indexer.apply_event(make_store_event(1, &[1])).await;
+        });
+
+        let waited_for_worker =
+            tokio::time::timeout(Duration::from_millis(100), &mut apply_task)
+                .await
+                .is_err();
+        assert!(
+            !indexer
+                .backend
+                .event_applied
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        let (lock, ready) = &*gate;
+        *lock.lock().expect("gate mutex poisoned") = true;
+        ready.notify_all();
+        if waited_for_worker {
+            apply_task.await.expect("apply_event task should complete");
+        }
+        assert!(
+            waited_for_worker,
+            "apply_event returned before the worker applied the event"
+        );
+        assert!(
+            indexer
+                .backend
+                .event_applied
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
     }
 }
