@@ -544,6 +544,10 @@ mod tests {
             view.fallback_reason,
             LowerTierFallbackReason::ConflictingReplay
         );
+        assert_eq!(
+            qualify_lower_tier_prediction(&view, 8),
+            LowerTierPredictionDisposition::PassiveFallback
+        );
     }
 
     #[test]
@@ -565,11 +569,12 @@ mod tests {
             ),
             LowerTierApplyResult::RejectedOldEpoch
         );
+        let awaiting_snapshot =
+            ledger.view(worker(), &identity(None), now + Duration::from_millis(3));
+        assert_eq!(awaiting_snapshot.status, LowerTierStateStatus::Unknown);
         assert_eq!(
-            ledger
-                .view(worker(), &identity(None), now + Duration::from_millis(3))
-                .status,
-            LowerTierStateStatus::Unknown
+            qualify_lower_tier_prediction(&awaiting_snapshot, 8),
+            LowerTierPredictionDisposition::PassiveFallback
         );
         ledger.apply(
             update(LowerTierUpdateKind::Snapshot, 2, 2, 100),
@@ -585,11 +590,11 @@ mod tests {
             update(LowerTierUpdateKind::Reset, 2, 3, 0),
             now + Duration::from_millis(6),
         );
+        let reset = ledger.view(worker(), &identity(None), now + Duration::from_millis(7));
+        assert_eq!(reset.status, LowerTierStateStatus::Unknown);
         assert_eq!(
-            ledger
-                .view(worker(), &identity(None), now + Duration::from_millis(7))
-                .status,
-            LowerTierStateStatus::Unknown
+            qualify_lower_tier_prediction(&reset, 8),
+            LowerTierPredictionDisposition::PassiveFallback
         );
     }
 
@@ -630,10 +635,18 @@ mod tests {
             mismatched.fallback_reason,
             LowerTierFallbackReason::IdentityMismatch
         );
+        assert_eq!(
+            qualify_lower_tier_prediction(&mismatched, 8),
+            LowerTierPredictionDisposition::PassiveFallback
+        );
 
         let stale = ledger.view(worker(), &identity(None), now + Duration::from_millis(11));
         assert_eq!(stale.status, LowerTierStateStatus::Stale);
         assert_eq!(stale.fallback_reason, LowerTierFallbackReason::Expired);
+        assert_eq!(
+            qualify_lower_tier_prediction(&stale, 8),
+            LowerTierPredictionDisposition::PassiveFallback
+        );
 
         ledger.mark_propagation_failure(worker());
         let failed = ledger.view(worker(), &identity(None), now + Duration::from_millis(1));
