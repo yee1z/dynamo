@@ -441,6 +441,11 @@ pub struct VllmConnectorSlot {
     /// Whether we actually performed a cache lookup for this request
     performed_cache_lookup: bool,
 
+    /// Whether the request-time connector actual has already been traced.
+    /// vLLM may retry the lookup while a request waits for admission or resumes
+    /// from preemption, but Phase D requires one ground-truth row per request.
+    connector_actual_trace_emitted: bool,
+
     /// Total number of blocks queried from host/disk cache
     total_blocks_queried: usize,
 
@@ -495,6 +500,7 @@ impl VllmConnectorSlot {
             tokens_cached_from_host: 0,
             tokens_cached_from_disk: 0,
             performed_cache_lookup: false,
+            connector_actual_trace_emitted: false,
             total_blocks_queried: 0,
             cache_stats,
             offload_min_priority,
@@ -534,6 +540,7 @@ impl VllmConnectorSlot {
             tokens_cached_from_host: 0,
             tokens_cached_from_disk: 0,
             performed_cache_lookup: false,
+            connector_actual_trace_emitted: false,
             total_blocks_queried: 0,
             cache_stats,
             offload_min_priority,
@@ -603,15 +610,23 @@ impl VllmConnectorSlot {
         sequence_hashes
     }
 
+    fn claim_connector_actual_trace(&mut self) -> bool {
+        if self.connector_actual_trace_emitted {
+            return false;
+        }
+        self.connector_actual_trace_emitted = true;
+        true
+    }
+
     fn emit_connector_match_end(
-        &self,
+        &mut self,
         actual_matched_tokens: usize,
         actual_tier: &'static str,
         host_blocks: usize,
         disk_blocks: usize,
         partial_prefix: bool,
     ) {
-        if !m1_trace_enabled() {
+        if !m1_trace_enabled() || !self.claim_connector_actual_trace() {
             return;
         }
         let canonical_id = canonical_request_id(&self.request_id);
@@ -2364,6 +2379,16 @@ mod connector_tests {
             next_router_sequence_hash(first_hash, second_hash),
             4_945_711_292_740_353_085
         );
+    }
+
+    #[test]
+    fn test_connector_actual_trace_is_once_per_request_across_retries() {
+        let (mut slot, _rx) = create_test_slot(96, 0);
+
+        assert!(slot.claim_connector_actual_trace());
+        assert!(!slot.claim_connector_actual_trace());
+        slot.reset_after_preemption();
+        assert!(!slot.claim_connector_actual_trace());
     }
 
     #[test]
