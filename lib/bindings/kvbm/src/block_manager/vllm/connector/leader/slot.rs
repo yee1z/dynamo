@@ -560,9 +560,21 @@ impl VllmConnectorSlot {
         Ok(())
     }
 
+    fn matched_block_ids(&self, actual_matched_blocks: usize) -> Vec<SequenceHash> {
+        self.sequence
+            .blocks()
+            .iter()
+            .take(actual_matched_blocks)
+            .map(|block| {
+                block
+                    .external_sequence_hash()
+                    .unwrap_or_else(|| block.sequence_hash())
+            })
+            .collect()
+    }
+
     fn emit_connector_match_end(
         &self,
-        sequence_hashes: &[SequenceHash],
         actual_matched_tokens: usize,
         actual_tier: &'static str,
         host_blocks: usize,
@@ -575,11 +587,7 @@ impl VllmConnectorSlot {
         let canonical_id = canonical_request_id(&self.request_id);
         let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
         let actual_matched_blocks = actual_matched_tokens / self.block_size;
-        let matched_block_ids = sequence_hashes
-            .iter()
-            .take(actual_matched_blocks)
-            .copied()
-            .collect::<Vec<_>>();
+        let matched_block_ids = self.matched_block_ids(actual_matched_blocks);
         let transfer_kind = match actual_tier {
             "host" => Some("h2d"),
             "disk" => Some("d2d"),
@@ -1197,14 +1205,7 @@ impl Slot for VllmConnectorSlot {
             // Still mark that we performed a lookup (even though we didn't need to query)
             self.performed_cache_lookup = true;
             self.total_blocks_queried = 0;
-            self.emit_connector_match_end(
-                &sequence_hashes,
-                num_computed_tokens,
-                "gpu",
-                0,
-                0,
-                false,
-            );
+            self.emit_connector_match_end(num_computed_tokens, "gpu", 0, 0, false);
             return Ok(());
         }
 
@@ -1272,14 +1273,7 @@ impl Slot for VllmConnectorSlot {
             } else {
                 "miss"
             };
-            self.emit_connector_match_end(
-                &sequence_hashes,
-                num_computed_tokens,
-                actual_tier,
-                0,
-                0,
-                false,
-            );
+            self.emit_connector_match_end(num_computed_tokens, actual_tier, 0, 0, false);
             return Ok(());
         }
 
@@ -1310,14 +1304,7 @@ impl Slot for VllmConnectorSlot {
             } else {
                 "miss"
             };
-            self.emit_connector_match_end(
-                &sequence_hashes,
-                num_computed_tokens,
-                actual_tier,
-                0,
-                0,
-                true,
-            );
+            self.emit_connector_match_end(num_computed_tokens, actual_tier, 0, 0, true);
             return Ok(());
         }
 
@@ -1327,7 +1314,6 @@ impl Slot for VllmConnectorSlot {
             "host"
         };
         self.emit_connector_match_end(
-            &sequence_hashes,
             num_computed_tokens + num_new_matched_tokens,
             actual_tier,
             host_blocks.len(),
@@ -2308,6 +2294,21 @@ mod connector_tests {
             completed_blocks[2].external_parent_sequence_hash(),
             Some(external_hashes[1])
         );
+        assert_eq!(slot.matched_block_ids(2), external_hashes[..2]);
+    }
+
+    #[test]
+    fn test_matched_block_ids_fall_back_to_internal_hashes() {
+        let (slot, _rx) = create_test_slot(96, 0);
+        let expected = slot
+            .sequence
+            .blocks()
+            .iter()
+            .take(2)
+            .map(|block| block.sequence_hash())
+            .collect::<Vec<_>>();
+
+        assert_eq!(slot.matched_block_ids(2), expected);
     }
 
     #[test]
