@@ -34,6 +34,14 @@ impl CacheIdentity {
             adapter: adapter.map(Into::into),
         }
     }
+
+    pub fn with_adapter(&self, adapter: Option<String>) -> Self {
+        Self {
+            model: self.model.clone(),
+            salt: self.salt.clone(),
+            adapter,
+        }
+    }
 }
 
 /// How an update relates to the worker's state stream.
@@ -45,6 +53,16 @@ pub enum LowerTierUpdateKind {
     Incremental,
     /// Worker restart or cache reset barrier. A new snapshot is required.
     Reset,
+}
+
+impl LowerTierUpdateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Incremental => "incremental",
+            Self::Reset => "reset",
+        }
+    }
 }
 
 /// Metadata-only update emitted by a worker.
@@ -154,6 +172,19 @@ pub enum LowerTierApplyResult {
     Conflict,
 }
 
+impl LowerTierApplyResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppliedKnown => "applied_known",
+            Self::AppliedUnknown => "applied_unknown",
+            Self::Duplicate => "duplicate",
+            Self::RejectedOldEpoch => "rejected_old_epoch",
+            Self::RejectedOutOfOrder => "rejected_out_of_order",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LedgerEntry {
     identity: CacheIdentity,
@@ -165,6 +196,7 @@ struct LedgerEntry {
     observed_at: Instant,
     status: LowerTierStateStatus,
     fallback_reason: LowerTierFallbackReason,
+    transitioning_from_known: bool,
 }
 
 impl LedgerEntry {
@@ -193,6 +225,7 @@ impl LedgerEntry {
             observed_at,
             status,
             fallback_reason,
+            transitioning_from_known: false,
         }
     }
 }
@@ -235,6 +268,7 @@ impl LowerTierStateLedger {
                     let mut conflict = existing.clone();
                     conflict.status = LowerTierStateStatus::Conflict;
                     conflict.fallback_reason = LowerTierFallbackReason::ConflictingReplay;
+                    conflict.transitioning_from_known = false;
                     entries.insert(update.worker, conflict);
                     return LowerTierApplyResult::Conflict;
                 }
@@ -266,8 +300,10 @@ impl LowerTierStateLedger {
             LowerTierUpdateKind::Incremental
                 if existing.is_none()
                     || epoch_advanced
-                    || existing
-                        .is_some_and(|entry| entry.status != LowerTierStateStatus::Known) =>
+                    || existing.is_some_and(|entry| {
+                        entry.status != LowerTierStateStatus::Known
+                            && !entry.transitioning_from_known
+                    }) =>
             {
                 (
                     LowerTierStateStatus::Unknown,
@@ -294,6 +330,20 @@ impl LowerTierStateLedger {
         if let Some(entry) = self.entries.write().unwrap().get_mut(&worker) {
             entry.status = LowerTierStateStatus::Unknown;
             entry.fallback_reason = LowerTierFallbackReason::PropagationFailure;
+            entry.transitioning_from_known = false;
+        }
+    }
+
+    /// Temporarily fail closed while the indexer applies an accepted event.
+    /// A same-epoch incremental may restore `known`; a real propagation
+    /// failure cannot.
+    pub fn begin_update(&self, worker: WorkerWithDpRank) {
+        if let Some(entry) = self.entries.write().unwrap().get_mut(&worker)
+            && entry.status == LowerTierStateStatus::Known
+        {
+            entry.status = LowerTierStateStatus::Unknown;
+            entry.fallback_reason = LowerTierFallbackReason::PropagationFailure;
+            entry.transitioning_from_known = true;
         }
     }
 
@@ -339,6 +389,26 @@ impl LowerTierStateLedger {
         }
         base
     }
+
+    /// Snapshot every worker view at one router-local instant. Used when a
+    /// queued request refreshes its overlap scores before dispatch.
+    pub fn views(
+        &self,
+        expected_identity: &CacheIdentity,
+        now: Instant,
+    ) -> FxHashMap<WorkerWithDpRank, LowerTierStateView> {
+        let workers = self
+            .entries
+            .read()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| (worker, self.view(worker, expected_identity, now)))
+            .collect()
+    }
 }
 
 /// Whether an observed match can be interpreted as a verified prediction.
@@ -376,6 +446,8 @@ pub fn qualify_lower_tier_prediction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     fn worker() -> WorkerWithDpRank {
         WorkerWithDpRank::new(7, 1)
@@ -569,6 +641,74 @@ mod tests {
         assert_eq!(
             qualify_lower_tier_prediction(&failed, 8),
             LowerTierPredictionDisposition::PassiveFallback
+        );
+    }
+
+    #[test]
+    fn concurrent_reads_and_updates_return_complete_views() {
+        let ledger = Arc::new(LowerTierStateLedger::new(Duration::from_secs(10)));
+        let now = Instant::now();
+        ledger.apply(update(LowerTierUpdateKind::Snapshot, 1, 1, 10), now);
+
+        let writer = {
+            let ledger = ledger.clone();
+            thread::spawn(move || {
+                for version in 2..=1_000 {
+                    ledger.apply(
+                        update(LowerTierUpdateKind::Incremental, 1, version, version),
+                        Instant::now(),
+                    );
+                }
+            })
+        };
+        let reader = {
+            let ledger = ledger.clone();
+            thread::spawn(move || {
+                for _ in 0..1_000 {
+                    let view = ledger.view(worker(), &identity(None), Instant::now());
+                    assert_eq!(view.status, LowerTierStateStatus::Known);
+                    assert!(view.version.is_some());
+                    assert_eq!(view.worker_epoch, Some(1));
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            ledger
+                .view(worker(), &identity(None), Instant::now())
+                .version,
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn in_flight_index_update_is_passive_then_incremental_restores_known() {
+        let ledger = LowerTierStateLedger::new(Duration::from_secs(10));
+        let now = Instant::now();
+        ledger.apply(update(LowerTierUpdateKind::Snapshot, 1, 1, 10), now);
+
+        ledger.begin_update(worker());
+        let in_flight = ledger.view(worker(), &identity(None), now);
+        assert_eq!(in_flight.status, LowerTierStateStatus::Unknown);
+        assert_eq!(
+            qualify_lower_tier_prediction(&in_flight, 4),
+            LowerTierPredictionDisposition::PassiveFallback
+        );
+
+        assert_eq!(
+            ledger.apply(
+                update(LowerTierUpdateKind::Incremental, 1, 2, 20),
+                now + Duration::from_millis(1),
+            ),
+            LowerTierApplyResult::AppliedKnown
+        );
+        assert_eq!(
+            ledger
+                .view(worker(), &identity(None), now + Duration::from_millis(2))
+                .status,
+            LowerTierStateStatus::Known
         );
     }
 }

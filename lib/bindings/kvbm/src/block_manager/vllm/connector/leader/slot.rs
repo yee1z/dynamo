@@ -36,6 +36,11 @@ fn m1_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DYN_M1_TRACE").is_some())
 }
 
+fn phase_d_state_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
+}
+
 fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is writable and CLOCK_MONOTONIC is shared by host processes.
@@ -368,6 +373,7 @@ impl<R: RequestKey> Drop for ConnectorSlotManager<R> {
 
 pub struct VllmConnectorSlot {
     request_id: String,
+    salt_hash: SaltHash,
 
     /// The state of the slot.
     state: SlotState,
@@ -461,6 +467,7 @@ impl VllmConnectorSlot {
 
         Self {
             request_id,
+            salt_hash,
             sequence,
             block_manager: Some(block_manager),
             block_size,
@@ -500,6 +507,7 @@ impl VllmConnectorSlot {
         let sequence = TokenBlockSequence::new(tokens, block_size as u32, Some(salt_hash));
         Self {
             request_id,
+            salt_hash,
             sequence,
             block_manager: None,
             block_size,
@@ -550,6 +558,69 @@ impl VllmConnectorSlot {
         }
 
         Ok(())
+    }
+
+    fn emit_connector_match_end(
+        &self,
+        sequence_hashes: &[SequenceHash],
+        actual_matched_tokens: usize,
+        actual_tier: &'static str,
+        host_blocks: usize,
+        disk_blocks: usize,
+        partial_prefix: bool,
+    ) {
+        if !m1_trace_enabled() {
+            return;
+        }
+        let canonical_id = canonical_request_id(&self.request_id);
+        let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
+        let actual_matched_blocks = actual_matched_tokens / self.block_size;
+        let matched_block_ids = sequence_hashes
+            .iter()
+            .take(actual_matched_blocks)
+            .copied()
+            .collect::<Vec<_>>();
+        let transfer_kind = match actual_tier {
+            "host" => Some("h2d"),
+            "disk" => Some("d2d"),
+            _ => None,
+        };
+        tracing::info!(
+            "DYN_M1_TRACE {}",
+            serde_json::json!({
+                "schema": if phase_d_state_trace_enabled() { 2 } else { 1 },
+                "ts_ns": monotonic_ns(),
+                "request_id": canonical_id,
+                "request_key": request_key,
+                "request_key_hex": nvtx::key_hex(request_key),
+                "transfer_key": 0,
+                "transfer_key_hex": "0000000000000000",
+                "component": "connector",
+                "event": "connector_match_end",
+                "worker_id": std::env::var("DYN_FPM_WORKER_ID")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok()),
+                "dp_rank": std::env::var("DYN_PHASE_D_DP_RANK")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0),
+                "actual_matched_tokens": actual_matched_tokens,
+                "actual_matched_blocks": actual_matched_blocks,
+                "actual_tier": actual_tier,
+                "host_blocks": host_blocks,
+                "disk_blocks": disk_blocks,
+                "matched_block_ids": matched_block_ids,
+                "cache_identity": {
+                    "model": std::env::var("MODEL").unwrap_or_else(|_| "unknown".to_string()),
+                    "salt_hash": self.salt_hash,
+                    "adapter": null,
+                },
+                "transfer_kind": transfer_kind,
+                "transfer_start_ns": null,
+                "transfer_end_ns": null,
+                "partial_prefix": partial_prefix,
+            })
+        );
     }
 
     fn mark_as_skipped_prefill(&mut self) -> Result<(), SlotError> {
@@ -1126,13 +1197,14 @@ impl Slot for VllmConnectorSlot {
             // Still mark that we performed a lookup (even though we didn't need to query)
             self.performed_cache_lookup = true;
             self.total_blocks_queried = 0;
-            if m1_trace_enabled() {
-                tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":\"gpu\",\"host_blocks\":0,\"disk_blocks\":0}}",
-                    monotonic_ns(), canonical_request_id(&self.request_id),
-                    request_key, request_key_hex, num_computed_tokens
-                );
-            }
+            self.emit_connector_match_end(
+                &sequence_hashes,
+                num_computed_tokens,
+                "gpu",
+                0,
+                0,
+                false,
+            );
             return Ok(());
         }
 
@@ -1195,15 +1267,19 @@ impl Slot for VllmConnectorSlot {
 
         // early exit if we did not match any blocks
         if num_matched_blocks == 0 {
-            if m1_trace_enabled() {
-                let actual_tier = if num_computed_tokens > 0 { "gpu" } else { "miss" };
-                tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0}}",
-                    monotonic_ns(), canonical_request_id(&self.request_id),
-                    request_key, request_key_hex,
-                    num_computed_tokens, actual_tier
-                );
-            }
+            let actual_tier = if num_computed_tokens > 0 {
+                "gpu"
+            } else {
+                "miss"
+            };
+            self.emit_connector_match_end(
+                &sequence_hashes,
+                num_computed_tokens,
+                actual_tier,
+                0,
+                0,
+                false,
+            );
             return Ok(());
         }
 
@@ -1229,29 +1305,35 @@ impl Slot for VllmConnectorSlot {
 
         // early exit if we need to onboard 0 blocks (after potentially dropping the last block)
         if num_new_matched_tokens == 0 {
-            if m1_trace_enabled() {
-                let actual_tier = if num_computed_tokens > 0 { "gpu" } else { "miss" };
-                tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":0,\"disk_blocks\":0,\"partial_prefix\":true}}",
-                    monotonic_ns(), canonical_request_id(&self.request_id),
-                    request_key, request_key_hex,
-                    num_computed_tokens, actual_tier
-                );
-            }
+            let actual_tier = if num_computed_tokens > 0 {
+                "gpu"
+            } else {
+                "miss"
+            };
+            self.emit_connector_match_end(
+                &sequence_hashes,
+                num_computed_tokens,
+                actual_tier,
+                0,
+                0,
+                true,
+            );
             return Ok(());
         }
 
-        let actual_tier = if !disk_blocks.is_empty() { "disk" } else { "host" };
-        if m1_trace_enabled() {
-            tracing::info!(
-                "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_end\",\"actual_matched_tokens\":{},\"actual_tier\":{:?},\"host_blocks\":{},\"disk_blocks\":{},\"partial_prefix\":{}}}",
-                monotonic_ns(), canonical_request_id(&self.request_id),
-                request_key, request_key_hex,
-                num_computed_tokens + num_new_matched_tokens, actual_tier,
-                host_blocks.len(), disk_blocks.len(),
-                num_computed_tokens + num_new_matched_tokens < self.sequence().total_tokens()
-            );
-        }
+        let actual_tier = if !disk_blocks.is_empty() {
+            "disk"
+        } else {
+            "host"
+        };
+        self.emit_connector_match_end(
+            &sequence_hashes,
+            num_computed_tokens + num_new_matched_tokens,
+            actual_tier,
+            host_blocks.len(),
+            disk_blocks.len(),
+            num_computed_tokens + num_new_matched_tokens < self.sequence().total_tokens(),
+        );
 
         self.staging_from_host = if !host_blocks.is_empty() {
             Some(host_blocks)

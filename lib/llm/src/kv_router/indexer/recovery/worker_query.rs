@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -21,7 +22,8 @@ use super::worker_query_transport::{RuntimeWorkerQueryTransport, WorkerQueryTran
 use crate::kv_router::Indexer;
 use dynamo_kv_router::{
     indexer::WorkerKvQueryResponse,
-    protocols::{DpRank, KvCacheEventData, RouterEvent, WorkerId},
+    protocols::{DpRank, KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank},
+    scheduling::{CacheIdentity, LowerTierStateLedger, LowerTierStateUpdate, LowerTierUpdateKind},
 };
 
 #[cfg(test)]
@@ -36,6 +38,8 @@ use async_trait::async_trait;
 use dynamo_kv_router::indexer::{LocalKvIndexer, WorkerKvQueryRequest};
 #[cfg(test)]
 use dynamo_kv_router::recovery::CursorState;
+#[cfg(test)]
+use dynamo_kv_router::scheduling::LowerTierStateStatus;
 #[cfg(test)]
 use dynamo_runtime::pipeline::{AsyncEngine, SingleIn};
 
@@ -61,6 +65,8 @@ pub struct WorkerQueryClient {
     transport: Arc<dyn WorkerQueryTransport>,
     /// Indexer for applying recovered events and worker removals.
     indexer: Indexer,
+    lower_tier_state: Arc<LowerTierStateLedger>,
+    cache_identity: CacheIdentity,
     worker_states: DashMap<WorkerId, Arc<Mutex<WorkerState>>>,
     query_endpoints: WorkerQueryEndpointDirectory,
     recovery_semaphore: Arc<Semaphore>,
@@ -74,11 +80,15 @@ impl WorkerQueryClient {
         component: Component,
         indexer: Indexer,
         transport: Arc<dyn WorkerQueryTransport>,
+        lower_tier_state: Arc<LowerTierStateLedger>,
+        cache_identity: CacheIdentity,
     ) -> Arc<Self> {
         Arc::new(Self {
             component,
             transport,
             indexer,
+            lower_tier_state,
+            cache_identity,
             worker_states: DashMap::new(),
             query_endpoints: WorkerQueryEndpointDirectory::default(),
             recovery_semaphore: Arc::new(Semaphore::new(RECOVERY_CONCURRENCY_LIMIT)),
@@ -91,9 +101,20 @@ impl WorkerQueryClient {
     /// The background loop watches `ComponentEndpoints` discovery for query endpoints,
     /// recovers each `(worker_id, dp_rank)` as it appears, and sends worker removal
     /// events when all dp_ranks for a worker disappear.
-    pub async fn spawn(component: Component, indexer: Indexer) -> Result<Arc<Self>> {
+    pub async fn spawn(
+        component: Component,
+        indexer: Indexer,
+        lower_tier_state: Arc<LowerTierStateLedger>,
+        cache_identity: CacheIdentity,
+    ) -> Result<Arc<Self>> {
         let transport = Arc::new(RuntimeWorkerQueryTransport::new(&component).await?);
-        let client = Self::new(component.clone(), indexer, transport);
+        let client = Self::new(
+            component.clone(),
+            indexer,
+            transport,
+            lower_tier_state,
+            cache_identity,
+        );
 
         let client_bg = client.clone();
         let cancel_token = component.drt().primary_token();
@@ -164,6 +185,84 @@ impl WorkerQueryClient {
             .clone()
     }
 
+    fn state_digest<T: std::fmt::Debug>(value: &T) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(format!("{value:?}").as_bytes())
+    }
+
+    fn apply_state_update(
+        &self,
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        kind: LowerTierUpdateKind,
+        worker_epoch: u64,
+        version: u64,
+        summary_digest: u64,
+    ) {
+        let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+        let updated_ns = crate::kv_router::monotonic_ns();
+        let update = LowerTierStateUpdate {
+            worker,
+            identity: self.cache_identity.clone(),
+            kind,
+            worker_epoch,
+            version,
+            updated_ns,
+            summary_digest,
+        };
+        let result = self.lower_tier_state.apply(update, Instant::now());
+        let view = self
+            .lower_tier_state
+            .view(worker, &self.cache_identity, Instant::now());
+        tracing::info!(
+            "DYN_PHASE_D_STATE_UPDATE {}",
+            serde_json::json!({
+                "schema": 1,
+                "router_receipt_ns": crate::kv_router::monotonic_ns(),
+                "worker_id": worker_id,
+                "dp_rank": dp_rank,
+                "kind": kind.as_str(),
+                "worker_epoch": worker_epoch,
+                "version": version,
+                "worker_updated_ns": updated_ns,
+                "identity_digest": Self::state_digest(&self.cache_identity),
+                "summary_digest": summary_digest,
+                "apply_result": result.as_str(),
+                "resulting_status": view.status.as_str(),
+                "fallback_reason": view.fallback_reason.as_str(),
+            })
+        );
+    }
+
+    fn mark_propagation_failure(&self, worker_id: WorkerId, dp_rank: DpRank) {
+        let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+        self.lower_tier_state.mark_propagation_failure(worker);
+        let view = self
+            .lower_tier_state
+            .view(worker, &self.cache_identity, Instant::now());
+        tracing::info!(
+            "DYN_PHASE_D_STATE_UPDATE {}",
+            serde_json::json!({
+                "schema": 1,
+                "router_receipt_ns": crate::kv_router::monotonic_ns(),
+                "worker_id": worker_id,
+                "dp_rank": dp_rank,
+                "kind": "failure",
+                "worker_epoch": view.worker_epoch,
+                "version": view.version,
+                "identity_digest": Self::state_digest(&self.cache_identity),
+                "summary_digest": 0,
+                "apply_result": "propagation_failure",
+                "resulting_status": view.status.as_str(),
+                "fallback_reason": view.fallback_reason.as_str(),
+            })
+        );
+    }
+
+    fn begin_state_update(&self, worker_id: WorkerId, dp_rank: DpRank) {
+        self.lower_tier_state
+            .begin_update(WorkerWithDpRank::new(worker_id, dp_rank));
+    }
+
     fn query_target_for(&self, worker_id: WorkerId, dp_rank: DpRank) -> Option<Instance> {
         if let Some(target) = self.query_endpoints.target_for(worker_id, dp_rank) {
             return Some(target);
@@ -228,6 +327,14 @@ impl WorkerQueryClient {
         let spawn = {
             let mut worker_state = worker_state.lock().await;
             let action = worker_state.handle_discovered_rank(dp_rank, replaced.is_some());
+            self.apply_state_update(
+                worker_id,
+                dp_rank,
+                LowerTierUpdateKind::Reset,
+                worker_state.epoch,
+                0,
+                0,
+            );
             if action.reset_rank {
                 self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
             }
@@ -293,6 +400,7 @@ impl WorkerQueryClient {
             cancel.cancel();
         }
 
+        self.mark_propagation_failure(worker_id, dp_rank);
         if should_remove_worker {
             tracing::warn!("WorkerQueryClient: all dp_ranks gone for worker {worker_id}, removing");
             self.worker_states.remove(&worker_id);
@@ -306,6 +414,14 @@ impl WorkerQueryClient {
         let clear_event_id = event.event.event_id;
 
         worker_state.apply_worker_clear_barrier(clear_dp_rank, clear_event_id);
+        self.apply_state_update(
+            worker_id,
+            clear_dp_rank,
+            LowerTierUpdateKind::Reset,
+            worker_state.epoch,
+            clear_event_id.saturating_add(1),
+            Self::state_digest(&event),
+        );
 
         tracing::info!(
             "Applying clear barrier for worker {worker_id}; invalidating recovery across {} dp_ranks",
@@ -340,6 +456,14 @@ impl WorkerQueryClient {
                         "Applying clear barrier for worker {worker_id}; invalidating recovery across {} dp_ranks",
                         worker_state.ranks.len()
                     );
+                    self.apply_state_update(
+                        worker_id,
+                        dp_rank,
+                        LowerTierUpdateKind::Reset,
+                        worker_state.epoch,
+                        event.event.event_id.saturating_add(1),
+                        Self::state_digest(&event),
+                    );
                     self.indexer.apply_event(event).await;
                     return;
                 }
@@ -350,7 +474,27 @@ impl WorkerQueryClient {
         match action {
             LiveEventAction::Ignore => {}
             LiveEventAction::ApplyDirect(event) => {
+                let worker_epoch = self
+                    .worker_states
+                    .get(&worker_id)
+                    .map(|state| state.clone());
+                let epoch = if let Some(state) = worker_epoch {
+                    state.lock().await.epoch
+                } else {
+                    0
+                };
+                let version = event.event.event_id.saturating_add(1);
+                let summary_digest = Self::state_digest(&event);
+                self.begin_state_update(worker_id, dp_rank);
                 self.indexer.apply_event(event).await;
+                self.apply_state_update(
+                    worker_id,
+                    dp_rank,
+                    LowerTierUpdateKind::Incremental,
+                    epoch,
+                    version,
+                    summary_digest,
+                );
             }
             LiveEventAction::ApplyClear(_) => unreachable!("clear is applied under worker lock"),
             LiveEventAction::SpawnFullRestore { epoch } => {
@@ -479,6 +623,8 @@ impl WorkerQueryClient {
                 events,
                 last_event_id,
             }) => {
+                let summary_digest = Self::state_digest(&events);
+                self.begin_state_update(key.0, key.1);
                 tracing::debug!(
                     "Got {count} buffered events from worker {} dp_rank {}",
                     key.0,
@@ -497,12 +643,22 @@ impl WorkerQueryClient {
                     new_cursor = new_cursor.advance_to(event_id);
                 }
                 new_cursor = new_cursor.advance_to(last_event_id);
+                self.apply_state_update(
+                    key.0,
+                    key.1,
+                    LowerTierUpdateKind::Incremental,
+                    epoch,
+                    last_event_id.saturating_add(1),
+                    summary_digest,
+                );
                 successful_response = true;
             }
             Ok(WorkerKvQueryResponse::TreeDump {
                 events,
                 last_event_id,
             }) => {
+                let summary_digest = Self::state_digest(&events);
+                self.begin_state_update(key.0, key.1);
                 let represented_blocks = events
                     .iter()
                     .map(|event| match &event.event.data {
@@ -520,6 +676,14 @@ impl WorkerQueryClient {
                 );
                 self.apply_tree_dump_replace_locked(key.0, key.1, events)
                     .await;
+                self.apply_state_update(
+                    key.0,
+                    key.1,
+                    LowerTierUpdateKind::Snapshot,
+                    epoch,
+                    last_event_id.saturating_add(1),
+                    summary_digest,
+                );
                 new_cursor = new_cursor.advance_to(last_event_id);
                 successful_response = true;
             }
@@ -563,7 +727,23 @@ impl WorkerQueryClient {
             loop {
                 match worker_state.next_pending_drain_action(key.1) {
                     PendingDrainAction::Apply(event) => {
-                        self.indexer.apply_event(event).await;
+                        if matches!(&event.event.data, KvCacheEventData::Cleared) {
+                            self.apply_worker_clear_locked(&mut worker_state, event)
+                                .await;
+                        } else {
+                            let version = event.event.event_id.saturating_add(1);
+                            let summary_digest = Self::state_digest(&event);
+                            self.begin_state_update(key.0, key.1);
+                            self.indexer.apply_event(event).await;
+                            self.apply_state_update(
+                                key.0,
+                                key.1,
+                                LowerTierUpdateKind::Incremental,
+                                worker_state.epoch,
+                                version,
+                                summary_digest,
+                            );
+                        }
                     }
                     PendingDrainAction::RecoverFrom(start_event_id) => {
                         follow_up_start = Some(start_event_id);
@@ -574,6 +754,7 @@ impl WorkerQueryClient {
             }
         } else {
             worker_state.finish_failed_recovery(key.1);
+            self.mark_propagation_failure(key.0, key.1);
         }
         let follow_up_epoch = worker_state.epoch;
         drop(worker_state);
@@ -824,7 +1005,13 @@ mod tests {
         let component = make_test_component(name).await;
         let (kv_indexer, indexer) = make_test_indexer();
         let transport = Arc::new(MockWorkerQueryTransport::default());
-        let client = WorkerQueryClient::new(component, indexer, transport.clone());
+        let client = WorkerQueryClient::new(
+            component,
+            indexer,
+            transport.clone(),
+            Arc::new(LowerTierStateLedger::new(Duration::from_secs(10))),
+            CacheIdentity::new("test-model", "", None::<String>),
+        );
         (client, transport, kv_indexer)
     }
 
@@ -1375,6 +1562,13 @@ mod tests {
             stored_block_hashes(&events),
             vec![11, 12, 13, 14, 15, 16, 17]
         );
+        let state = client.lower_tier_state.view(
+            WorkerWithDpRank::new(key.0, key.1),
+            &client.cache_identity,
+            Instant::now(),
+        );
+        assert_eq!(state.status, LowerTierStateStatus::Known);
+        assert_eq!(state.version, Some(18));
     }
 
     #[tokio::test]
@@ -1742,6 +1936,14 @@ mod tests {
         let events = kv_indexer.dump_events().await.unwrap();
         assert_eq!(stored_block_hashes(&events), vec![0, 11]);
         assert_eq!(transport.call_count(), 1);
+        let state = client.lower_tier_state.view(
+            WorkerWithDpRank::new(key.0, key.1),
+            &client.cache_identity,
+            Instant::now(),
+        );
+        assert_eq!(state.status, LowerTierStateStatus::Known);
+        assert_eq!(state.version, Some(12));
+        assert_eq!(state.worker_epoch, Some(0));
     }
 
     #[tokio::test]

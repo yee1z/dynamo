@@ -654,6 +654,7 @@ impl<
                 self.overlap_scores_refresh.as_deref(),
                 self.overlap_refresh_after,
                 queued.block_hashes.as_deref(),
+                queued.request.lora_name.as_deref(),
                 queued.enqueue_at,
                 decay_now,
             )
@@ -775,13 +776,21 @@ impl<
                 } else {
                     0
                 };
+                let predicted_block_ids = request
+                    .token_seq
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .take(predicted_blocks as usize)
+                    .copied()
+                    .collect::<Vec<_>>();
                 let disposition = qualify_lower_tier_prediction(state, lower_tier_blocks as usize);
                 #[cfg(feature = "phase-c-nvtx")]
                 {
                     let canonical_id = canonical_request_id(request_id);
                     let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
                     tracing::info!(
-                        "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
+                        "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_block_ids\":{:?},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
                         monotonic_ns(),
                         canonical_id,
                         request_key,
@@ -790,6 +799,7 @@ impl<
                         response.best_worker.dp_rank,
                         predicted_blocks.saturating_mul(self.block_size),
                         predicted_blocks,
+                        predicted_block_ids,
                         predicted_tier,
                         state.status.as_str(),
                         state_version,
@@ -802,13 +812,14 @@ impl<
                 }
                 #[cfg(not(feature = "phase-c-nvtx"))]
                 tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
+                    "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_block_ids\":{:?},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
                     monotonic_ns(),
                     canonical_request_id(request_id),
                     response.best_worker.worker_id,
                     response.best_worker.dp_rank,
                     predicted_blocks.saturating_mul(self.block_size),
                     predicted_blocks,
+                    predicted_block_ids,
                     predicted_tier,
                     state.status.as_str(),
                     state_version,
@@ -1401,7 +1412,11 @@ mod tests {
 
     #[async_trait]
     impl OverlapScoresRefresh for CountingRefresher {
-        async fn refresh(&self, _block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap> {
+        async fn refresh(
+            &self,
+            _block_hashes: &[LocalBlockHash],
+            _lora_name: Option<&str>,
+        ) -> Option<RefreshedOverlap> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Some(self.response.clone())
         }
@@ -1437,7 +1452,11 @@ mod tests {
 
     #[async_trait]
     impl OverlapScoresRefresh for BlockingRefresher {
-        async fn refresh(&self, _block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap> {
+        async fn refresh(
+            &self,
+            _block_hashes: &[LocalBlockHash],
+            _lora_name: Option<&str>,
+        ) -> Option<RefreshedOverlap> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.started.notify_one();
             self.release.notified().await;

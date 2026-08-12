@@ -7,11 +7,13 @@ use anyhow::Result;
 use dynamo_kv_router::{
     config::KvRouterConfig,
     protocols::{KV_EVENT_SUBJECT, RouterEvent},
+    scheduling::{CacheIdentity, LowerTierStateLedger},
 };
 use dynamo_runtime::{
     component::Component, discovery::EventTransportKind, prelude::*,
     transports::event_plane::EventSubscriber,
 };
+use std::sync::Arc;
 
 /// Start a simplified background task for event consumption using the event plane.
 ///
@@ -27,6 +29,8 @@ async fn start_kv_router_background_event_plane(
     component: Component,
     indexer: Indexer,
     transport_kind: EventTransportKind,
+    lower_tier_state: Arc<LowerTierStateLedger>,
+    cache_identity: CacheIdentity,
 ) -> Result<()> {
     let cancellation_token = component.drt().primary_token();
 
@@ -45,7 +49,9 @@ async fn start_kv_router_background_event_plane(
 
     // WorkerQueryClient handles its own discovery loop for lifecycle + initial recovery.
     // No blocking wait — recovery happens asynchronously as endpoints are discovered.
-    let worker_query_client = WorkerQueryClient::spawn(component.clone(), indexer).await?;
+    let worker_query_client =
+        WorkerQueryClient::spawn(component.clone(), indexer, lower_tier_state, cache_identity)
+            .await?;
     let kv_event_subject = format!(
         "namespace.{}.component.{}.{}",
         component.namespace().name(),
@@ -116,6 +122,8 @@ pub async fn start_subscriber(
     component: Component,
     kv_router_config: &KvRouterConfig,
     indexer: Indexer,
+    lower_tier_state: Arc<LowerTierStateLedger>,
+    cache_identity: CacheIdentity,
 ) -> Result<()> {
     let transport_kind = component.drt().default_event_transport_kind();
 
@@ -156,6 +164,13 @@ pub async fn start_subscriber(
             tracing::info!("Using NATS Core subscription (local_indexer mode)");
         }
 
-        start_kv_router_background_event_plane(component, indexer, transport_kind).await
+        start_kv_router_background_event_plane(
+            component,
+            indexer,
+            transport_kind,
+            lower_tier_state,
+            cache_identity,
+        )
+        .await
     }
 }

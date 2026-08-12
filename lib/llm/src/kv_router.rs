@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -15,9 +19,9 @@ use dynamo_kv_router::{
         WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     scheduling::{
-        CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, ScheduleMode,
-        ScheduleRequest, TieredOverlapRefresher, effective_prefill_tokens,
-        overlap::cache_hit_estimates_from_tiered_matches,
+        CacheHitEstimates, CacheIdentity, LowerTierStateLedger, OverlapAnalysis,
+        OverloadedWorkerProvider, ScheduleMode, ScheduleRequest, TieredOverlapRefresher,
+        effective_prefill_tokens, overlap::cache_hit_estimates_from_tiered_matches,
     },
 };
 use dynamo_runtime::{
@@ -33,6 +37,7 @@ use dynamo_runtime::{
     traits::DistributedRuntimeProvider,
 };
 use futures::stream;
+use nix::libc;
 use tracing::Instrument;
 use validator::Validate;
 
@@ -126,6 +131,27 @@ pub const RADIX_STATE_FILE: &str = "radix-state";
 
 // for worker-local kvindexer query
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
+
+pub(crate) fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    debug_assert_eq!(rc, 0);
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+fn lower_tier_stale_after() -> Duration {
+    const DEFAULT_MS: u64 = 5_000;
+    let value = std::env::var("DYN_PHASE_D_STATE_STALE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    Duration::from_millis(value)
+}
 
 fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
     if !error.is_overload() {
@@ -230,6 +256,8 @@ where
     /// narrowed to the LoRA's allocated/loaded replicas inside `find_best_match_details`,
     /// covering both the decode and prefill routers (both built via `kv_chooser_for`).
     lora_filter: Option<Arc<crate::lora::LoraFilter>>,
+    lower_tier_state: Arc<LowerTierStateLedger>,
+    lower_tier_identity: CacheIdentity,
 }
 
 impl<Sel> KvRouter<Sel>
@@ -256,6 +284,12 @@ where
         let component = endpoint.component();
         let cancellation_token = component.drt().primary_token();
         let min_initial_workers = min_initial_workers_from_env()?;
+        let lower_tier_state = Arc::new(LowerTierStateLedger::new(lower_tier_stale_after()));
+        let lower_tier_identity = CacheIdentity::new(
+            model_name.as_deref().unwrap_or("unknown"),
+            "",
+            None::<String>,
+        );
 
         let indexer = Indexer::new(
             component,
@@ -279,11 +313,10 @@ where
         }
 
         let overlap_scores_refresh = indexer.supports_overlap_refresh().then(|| {
-            Arc::new(TieredOverlapRefresher::new(
-                indexer.clone(),
-                kv_router_config.clone(),
-                block_size,
-            ))
+            Arc::new(
+                TieredOverlapRefresher::new(indexer.clone(), kv_router_config.clone(), block_size)
+                    .with_lower_tier_state(lower_tier_state.clone(), lower_tier_identity.clone()),
+            )
         });
         let client_for_overload = client.clone();
         let overloaded_worker_provider: OverloadedWorkerProvider =
@@ -307,8 +340,14 @@ where
         if kv_router_config.use_remote_indexer {
             tracing::info!("Skipping KV event subscription (using remote indexer)");
         } else if kv_router_config.should_subscribe_to_kv_events() {
-            indexer::start_subscriber(component.clone(), &kv_router_config, indexer.clone())
-                .await?;
+            indexer::start_subscriber(
+                component.clone(),
+                &kv_router_config,
+                indexer.clone(),
+                lower_tier_state.clone(),
+                lower_tier_identity.clone(),
+            )
+            .await?;
         } else {
             tracing::info!(
                 "Skipping KV event subscription (use_kv_events={}, overlap_score_credit={})",
@@ -348,6 +387,8 @@ where
             _served_indexer_handle: served_indexer_handle,
             shared_cache,
             lora_filter,
+            lower_tier_state,
+            lower_tier_identity,
         })
     }
 
@@ -584,9 +625,22 @@ where
             })
             .unwrap_or((None, None));
 
-        let overlap =
+        let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
+        let expected_identity = self.lower_tier_identity.with_adapter(lora_name.clone());
+        let now = Instant::now();
+        for (&worker_id, config) in self.workers_with_configs.borrow().iter() {
+            let start = config.data_parallel_start_rank();
+            let end = start.saturating_add(config.data_parallel_size());
+            for dp_rank in start..end {
+                let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                overlap.lower_tier_state.insert(
+                    worker,
+                    self.lower_tier_state.view(worker, &expected_identity, now),
+                );
+            }
+        }
         drop(tiered_matches);
         let find_matches_elapsed = start.elapsed();
 

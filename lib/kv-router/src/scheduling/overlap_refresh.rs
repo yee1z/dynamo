@@ -22,7 +22,10 @@
 //! Refresh failures are non-fatal: an implementation can return `None` and the queue will
 //! dispatch with the (stale) original scores rather than dropping the request.
 
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 
@@ -30,7 +33,10 @@ use crate::config::KvRouterConfig;
 use crate::indexer::TieredMatchProvider;
 use crate::protocols::LocalBlockHash;
 
-use super::overlap::{OverlapAnalysis, OverlapSignals};
+use super::{
+    lower_tier_state::{CacheIdentity, LowerTierStateLedger},
+    overlap::{OverlapAnalysis, OverlapSignals},
+};
 
 /// Result of a successful overlap refresh.
 ///
@@ -45,13 +51,19 @@ pub type RefreshedOverlap = OverlapSignals;
 /// the original scores.
 #[async_trait]
 pub trait OverlapScoresRefresh: Send + Sync {
-    async fn refresh(&self, block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap>;
+    async fn refresh(
+        &self,
+        block_hashes: &[LocalBlockHash],
+        lora_name: Option<&str>,
+    ) -> Option<RefreshedOverlap>;
 }
 
 pub struct TieredOverlapRefresher<P> {
     provider: P,
     config: KvRouterConfig,
     block_size: u32,
+    lower_tier_state: Option<Arc<LowerTierStateLedger>>,
+    lower_tier_identity: Option<CacheIdentity>,
 }
 
 impl<P> TieredOverlapRefresher<P> {
@@ -60,13 +72,29 @@ impl<P> TieredOverlapRefresher<P> {
             provider,
             config,
             block_size,
+            lower_tier_state: None,
+            lower_tier_identity: None,
         }
+    }
+
+    pub fn with_lower_tier_state(
+        mut self,
+        state: Arc<LowerTierStateLedger>,
+        identity: CacheIdentity,
+    ) -> Self {
+        self.lower_tier_state = Some(state);
+        self.lower_tier_identity = Some(identity);
+        self
     }
 }
 
 #[async_trait]
 impl<P: TieredMatchProvider> OverlapScoresRefresh for TieredOverlapRefresher<P> {
-    async fn refresh(&self, block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap> {
+    async fn refresh(
+        &self,
+        block_hashes: &[LocalBlockHash],
+        lora_name: Option<&str>,
+    ) -> Option<RefreshedOverlap> {
         if block_hashes.is_empty() {
             return None;
         }
@@ -77,7 +105,12 @@ impl<P: TieredMatchProvider> OverlapScoresRefresh for TieredOverlapRefresher<P> 
                 return None;
             }
         };
-        Some(OverlapAnalysis::new(&self.config, self.block_size, &tiered).signals())
+        let mut overlap = OverlapAnalysis::new(&self.config, self.block_size, &tiered).signals();
+        if let (Some(state), Some(identity)) = (&self.lower_tier_state, &self.lower_tier_identity) {
+            let expected_identity = identity.with_adapter(lora_name.map(str::to_string));
+            overlap.lower_tier_state = state.views(&expected_identity, Instant::now());
+        }
+        Some(overlap)
     }
 }
 
@@ -149,6 +182,7 @@ pub async fn refresh_overlap<RF: OverlapScoresRefresh + ?Sized>(
     refresher: Option<&RF>,
     refresh_after: Option<Duration>,
     block_hashes: Option<&[LocalBlockHash]>,
+    lora_name: Option<&str>,
     enqueue_at: tokio::time::Instant,
     now: tokio::time::Instant,
 ) -> Option<RefreshedOverlap> {
@@ -161,7 +195,7 @@ pub async fn refresh_overlap<RF: OverlapScoresRefresh + ?Sized>(
     ) {
         return None;
     }
-    refresher?.refresh(block_hashes?).await
+    refresher?.refresh(block_hashes?, lora_name).await
 }
 
 /// Default no-op refresher used when dequeue-time overlap refresh is not configured.
@@ -170,7 +204,11 @@ pub struct NoopOverlapScoresRefresh;
 
 #[async_trait]
 impl OverlapScoresRefresh for NoopOverlapScoresRefresh {
-    async fn refresh(&self, _block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap> {
+    async fn refresh(
+        &self,
+        _block_hashes: &[LocalBlockHash],
+        _lora_name: Option<&str>,
+    ) -> Option<RefreshedOverlap> {
         None
     }
 }
@@ -180,6 +218,7 @@ mod tests {
     use super::*;
     use crate::indexer::{KvRouterError, MatchDetails, TieredMatchDetails};
     use crate::protocols::{OverlapScores, WorkerWithDpRank};
+    use crate::scheduling::{LowerTierStateStatus, LowerTierStateUpdate, LowerTierUpdateKind};
     use std::{
         collections::HashMap,
         sync::{
@@ -223,7 +262,11 @@ mod tests {
 
     #[async_trait]
     impl OverlapScoresRefresh for CountingRefresher {
-        async fn refresh(&self, _block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap> {
+        async fn refresh(
+            &self,
+            _block_hashes: &[LocalBlockHash],
+            _lora_name: Option<&str>,
+        ) -> Option<RefreshedOverlap> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Some(RefreshedOverlap {
                 tier_overlap_blocks: Default::default(),
@@ -268,6 +311,7 @@ mod tests {
                 Some(&refresher),
                 Some(Duration::from_secs(10)),
                 Some(&hashes),
+                None,
                 enqueue_at,
                 now,
             )
@@ -290,9 +334,9 @@ mod tests {
         );
         let worker = WorkerWithDpRank::new(4, 0);
 
-        assert!(refresher.refresh(&[]).await.is_none());
+        assert!(refresher.refresh(&[], None).await.is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-        let refreshed = refresher.refresh(&[LocalBlockHash(1)]).await.unwrap();
+        let refreshed = refresher.refresh(&[LocalBlockHash(1)], None).await.unwrap();
         assert_eq!(refreshed.tier_overlap_blocks.device[&worker], 2);
         assert_eq!(refreshed.effective_cached_tokens[&worker], 32);
 
@@ -301,6 +345,48 @@ mod tests {
             KvRouterConfig::default(),
             16,
         );
-        assert!(failing.refresh(&[LocalBlockHash(1)]).await.is_none());
+        assert!(failing.refresh(&[LocalBlockHash(1)], None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tiered_refresher_attaches_fresh_request_identity_views() {
+        let worker = WorkerWithDpRank::new(4, 0);
+        let identity = CacheIdentity::new("model", "", None::<String>);
+        let state = Arc::new(LowerTierStateLedger::new(Duration::from_secs(10)));
+        state.apply(
+            LowerTierStateUpdate {
+                worker,
+                identity: identity.clone(),
+                kind: LowerTierUpdateKind::Snapshot,
+                worker_epoch: 1,
+                version: 7,
+                updated_ns: 1,
+                summary_digest: 99,
+            },
+            Instant::now(),
+        );
+        let refresher = TieredOverlapRefresher::new(
+            FakeProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            },
+            KvRouterConfig::default(),
+            16,
+        )
+        .with_lower_tier_state(state, identity);
+
+        let known = refresher.refresh(&[LocalBlockHash(1)], None).await.unwrap();
+        assert_eq!(
+            known.lower_tier_state[&worker].status,
+            LowerTierStateStatus::Known
+        );
+        let mismatch = refresher
+            .refresh(&[LocalBlockHash(1)], Some("adapter-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mismatch.lower_tier_state[&worker].status,
+            LowerTierStateStatus::Conflict
+        );
     }
 }
