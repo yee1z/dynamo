@@ -21,7 +21,7 @@ use crate::indexer::{
     KvIndexerMetrics, LowerTierContinuation, LowerTierIndexer, LowerTierMatchDetails, MatchDetails,
     ThreadPoolIndexer, WireTieredMatchDetails,
 };
-use crate::protocols::{LocalBlockHash, StorageTier};
+use crate::protocols::{LocalBlockHash, StorageTier, compute_seq_hash_for_block};
 
 fn phase_d_state_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -189,6 +189,10 @@ pub fn query_lower_tiers(
         return HashMap::new();
     }
 
+    // Engine event hashes are opaque and can differ from the router/KVBM
+    // canonical chain even when their local token-block hashes match. Derive
+    // the request chain locally so a device match can bridge into lower tiers.
+    let sequence_hashes = compute_seq_hash_for_block(sequence);
     let mut continuations = LowerTierMatchDetails::default().next_continuations;
     for (worker, matched_blocks) in &device_matches.overlap_scores.scores {
         let Some(last_hash) = device_matches.last_matched_hashes.get(worker).copied() else {
@@ -199,9 +203,17 @@ pub fn query_lower_tiers(
             continue;
         };
 
+        let matched_blocks = *matched_blocks as usize;
+        let continuation_hash = matched_blocks
+            .checked_sub(1)
+            .and_then(|index| sequence_hashes.get(index))
+            .copied()
+            .map(Into::into)
+            .unwrap_or(last_hash);
+
         continuations.insert(
             *worker,
-            LowerTierContinuation::new(*matched_blocks as usize, last_hash),
+            LowerTierContinuation::new(matched_blocks, continuation_hash),
         );
     }
 

@@ -430,8 +430,10 @@ mod tests {
         approx::PruneConfig,
         indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics, RoutingDecisionHashes},
         protocols::{
-            BlockHashOptions, LocalBlockHash, StorageTier, TokensWithHashes, WorkerWithDpRank,
-            compute_block_hash_for_seq, compute_seq_hash_for_block,
+            BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
+            KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier,
+            TokensWithHashes, WorkerWithDpRank, compute_block_hash_for_seq,
+            compute_seq_hash_for_block,
         },
     };
 
@@ -562,6 +564,65 @@ mod tests {
             matches
                 .lower_tier
                 .get(&StorageTier::Disk)
+                .and_then(|tier| tier.hits.get(&worker)),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn tiered_query_bridges_opaque_device_hash_with_canonical_request_hash() {
+        let indexer = make_test_indexer();
+        let worker = WorkerWithDpRank::new(7, 0);
+        let local_hashes = vec![LocalBlockHash(11), LocalBlockHash(12)];
+        let canonical_hashes = compute_seq_hash_for_block(&local_hashes);
+
+        let event = |event_id: u64,
+                     parent_hash: Option<u64>,
+                     block_hash: u64,
+                     tokens_hash: u64,
+                     storage_tier: StorageTier| {
+            RouterEvent::with_storage_tier(
+                7,
+                KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: parent_hash.map(ExternalSequenceBlockHash),
+                        start_position: None,
+                        blocks: vec![KvCacheStoredBlockData {
+                            block_hash: ExternalSequenceBlockHash(block_hash),
+                            tokens_hash: LocalBlockHash(tokens_hash),
+                            mm_extra_info: None,
+                        }],
+                    }),
+                    dp_rank: 0,
+                },
+                storage_tier,
+            )
+        };
+
+        // vLLM's device event sequence hash is opaque and may not equal the
+        // canonical router/KVBM sequence hash for the same local token block.
+        indexer
+            .apply_event(event(1, None, 1_001, 11, StorageTier::Device))
+            .await;
+        indexer
+            .apply_event(event(
+                2,
+                Some(canonical_hashes[0]),
+                canonical_hashes[1],
+                12,
+                StorageTier::HostPinned,
+            ))
+            .await;
+        flush_indexer(&indexer).await;
+
+        let matches = indexer.find_matches_by_tier(local_hashes).await.unwrap();
+
+        assert_eq!(matches.device.overlap_scores.scores.get(&worker), Some(&1));
+        assert_eq!(
+            matches
+                .lower_tier
+                .get(&StorageTier::HostPinned)
                 .and_then(|tier| tier.hits.get(&worker)),
             Some(&1)
         );
