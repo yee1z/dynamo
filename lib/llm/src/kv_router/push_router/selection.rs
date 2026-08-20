@@ -7,7 +7,7 @@ use dynamo_kv_router::{
     RouterConfigOverride,
     indexer::RoutingDecisionHashes,
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
-    scheduling::RoutingEligibility,
+    scheduling::{RoutingEligibility, SpeculativeOnboardingNotice},
 };
 use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
 
@@ -27,6 +27,7 @@ pub(super) struct WorkerSelection {
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
+    pub(super) speculative_onboarding_notice: Option<SpeculativeOnboardingNotice>,
     pub(super) scheduler_tracked: bool,
 }
 
@@ -100,6 +101,7 @@ impl KvPushRouter {
                 effective_overlap_blocks,
                 cached_tokens,
                 routing_hashes,
+                speculative_onboarding_notice,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,
@@ -107,6 +109,7 @@ impl KvPushRouter {
                 effective_overlap_blocks,
                 cached_tokens,
                 routing_hashes,
+                speculative_onboarding_notice: speculative_onboarding_notice.map(|notice| *notice),
                 scheduler_tracked: args.scheduler_tracked,
             }),
             FindBestMatchOutcome::QueueRejected { rejection } => Err(rejection.into()),

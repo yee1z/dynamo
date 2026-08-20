@@ -3,7 +3,12 @@
 
 use std::{sync::Arc, time::Duration};
 
-use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
+use dynamo_kv_router::{
+    protocols::{TokensWithHashes, WorkerWithDpRank},
+    scheduling::{
+        M2_NOTICE_EXTRA_ARGS_KEY, SpeculativeOnboardingNotice, SpeculativeOnboardingRejectReason,
+    },
+};
 use dynamo_runtime::{
     discovery::ClaimPayloadFuture,
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
@@ -285,6 +290,43 @@ impl KvPushRouter {
         self.warn_if_output_replay_annotation_ignored(&request, &selection);
 
         let (mut backend_input, context) = request.into_parts();
+        if let Some(notice) = selection.speculative_onboarding_notice.as_ref() {
+            let disposition = if notice.worker_id != selection.instance_id
+                || notice.dp_rank != selection.dp_rank
+            {
+                Err(SpeculativeOnboardingRejectReason::DispatchTargetMismatch)
+            } else {
+                attach_speculative_onboarding_notice(&mut backend_input.extra_args, notice)
+            };
+            match disposition {
+                Ok(()) => tracing::info!(
+                    "DYN_M2_TRACE {}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                        "request_id": &notice.request_id,
+                        "component": "router",
+                        "event": "notice_dispatched",
+                        "worker_id": notice.worker_id,
+                        "dp_rank": notice.dp_rank,
+                        "disposition": "dry_run",
+                    })
+                ),
+                Err(reason) => tracing::warn!(
+                    "DYN_M2_TRACE {}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                        "request_id": &notice.request_id,
+                        "component": "router",
+                        "event": "stage_reject",
+                        "worker_id": notice.worker_id,
+                        "dp_rank": notice.dp_rank,
+                        "reason": reason.as_str(),
+                    })
+                ),
+            }
+        }
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
@@ -422,6 +464,46 @@ impl KvPushRouter {
             return Ok((metadata, stream));
         };
         Ok((metadata, operation.into_stream(stream, close_on_finish)))
+    }
+}
+
+fn attach_speculative_onboarding_notice(
+    extra_args: &mut Option<serde_json::Value>,
+    notice: &SpeculativeOnboardingNotice,
+) -> Result<(), SpeculativeOnboardingRejectReason> {
+    if let Some(cache_salt) = extra_args
+        .as_ref()
+        .and_then(|value| value.get("nvext"))
+        .and_then(|value| value.get("cache_salt"))
+        && !cache_salt.as_str().is_some_and(str::is_empty)
+        && !cache_salt.is_null()
+    {
+        return Err(SpeculativeOnboardingRejectReason::NonEmptyCacheSalt);
+    }
+
+    if extra_args.is_none() {
+        *extra_args = Some(serde_json::json!({}));
+    }
+    let root = extra_args
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(SpeculativeOnboardingRejectReason::InvalidExtraArgs)?;
+    let dynamo = root
+        .entry("dynamo")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or(SpeculativeOnboardingRejectReason::InvalidExtraArgs)?;
+    let value = serde_json::to_value(notice)
+        .map_err(|_| SpeculativeOnboardingRejectReason::InvalidExtraArgs)?;
+    match dynamo.get(M2_NOTICE_EXTRA_ARGS_KEY) {
+        Some(existing) if existing != &value => {
+            Err(SpeculativeOnboardingRejectReason::ConflictingNotice)
+        }
+        Some(_) => Ok(()),
+        None => {
+            dynamo.insert(M2_NOTICE_EXTRA_ARGS_KEY.to_string(), value);
+            Ok(())
+        }
     }
 }
 
@@ -578,7 +660,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    use dynamo_kv_router::{DefaultWorkerSelector, config::KvRouterConfig};
+    use dynamo_kv_router::{
+        DefaultWorkerSelector,
+        config::KvRouterConfig,
+        scheduling::{M2_NOTICE_SCHEMA, SpeculativeCacheIdentity, SpeculativeOnboardingPolicy},
+    };
     use dynamo_runtime::{
         DistributedRuntime, Runtime,
         distributed::DistributedConfig,
@@ -602,6 +688,76 @@ mod tests {
             .output_options(Default::default())
             .build()
             .unwrap()
+    }
+
+    fn m2_notice() -> SpeculativeOnboardingNotice {
+        SpeculativeOnboardingNotice {
+            schema: M2_NOTICE_SCHEMA,
+            request_id: "request-1".to_string(),
+            worker_id: 7,
+            dp_rank: 0,
+            identity: SpeculativeCacheIdentity {
+                model: "test".to_string(),
+                salt: String::new(),
+                adapter: None,
+            },
+            worker_epoch: 2,
+            state_version: 3,
+            state_age_ms: 4,
+            prefix_start_block: 1,
+            block_hashes: vec![11, 12],
+            predicted_disk_blocks: 2,
+            predicted_queue_window_ms: None,
+            estimated_stage_ms: None,
+            deadline_budget_ms: None,
+            policy: SpeculativeOnboardingPolicy::DryRun,
+        }
+    }
+
+    #[test]
+    fn m2_notice_attach_is_idempotent_and_preserves_existing_extra_args() {
+        let mut extra_args = Some(serde_json::json!({"existing": true}));
+        let notice = m2_notice();
+
+        assert_eq!(
+            attach_speculative_onboarding_notice(&mut extra_args, &notice),
+            Ok(())
+        );
+        assert_eq!(
+            attach_speculative_onboarding_notice(&mut extra_args, &notice),
+            Ok(())
+        );
+        let value = extra_args.unwrap();
+        assert_eq!(value["existing"], true);
+        assert_eq!(
+            value["dynamo"][M2_NOTICE_EXTRA_ARGS_KEY],
+            serde_json::to_value(notice).unwrap()
+        );
+    }
+
+    #[test]
+    fn m2_notice_attach_rejects_non_empty_cache_salt() {
+        let mut extra_args = Some(serde_json::json!({
+            "nvext": {"cache_salt": "tenant-a"}
+        }));
+
+        assert_eq!(
+            attach_speculative_onboarding_notice(&mut extra_args, &m2_notice()),
+            Err(SpeculativeOnboardingRejectReason::NonEmptyCacheSalt)
+        );
+        assert!(extra_args.unwrap().get("dynamo").is_none());
+    }
+
+    #[test]
+    fn m2_notice_attach_rejects_conflicting_payload() {
+        let mut extra_args = Some(serde_json::json!({
+            "dynamo": {"m2_speculative_onboarding_notice": {"schema": 999}}
+        }));
+
+        assert_eq!(
+            attach_speculative_onboarding_notice(&mut extra_args, &m2_notice()),
+            Err(SpeculativeOnboardingRejectReason::ConflictingNotice)
+        );
     }
 
     async fn router(session_affinity_ttl: Option<Duration>) -> (KvPushRouter, Runtime) {

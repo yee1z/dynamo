@@ -122,6 +122,8 @@ logger = logging.getLogger(__name__)
 
 _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
+_DYNAMO_EXTRA_ARGS_KEY: Final = "dynamo"
+_M2_NOTICE_EXTRA_ARGS_KEY: Final = "m2_speculative_onboarding_notice"
 _DISTRIBUTED_WEIGHT_UPDATE_RESERVED_KEYS: Final = frozenset(
     {
         "allow_unpaused",
@@ -808,6 +810,23 @@ def build_sampling_params(
         passthrough_sampling_options = extra_args.get("sampling_options")
         if isinstance(passthrough_sampling_options, dict):
             sampling_options.update(passthrough_sampling_options)
+        dynamo_extra_args = extra_args.get(_DYNAMO_EXTRA_ARGS_KEY)
+        if isinstance(dynamo_extra_args, dict):
+            m2_notice = dynamo_extra_args.get(_M2_NOTICE_EXTRA_ARGS_KEY)
+            if isinstance(m2_notice, dict):
+                if sampling_params.extra_args is None:
+                    sampling_params.extra_args = {}
+                sampling_dynamo_args = sampling_params.extra_args.setdefault(
+                    _DYNAMO_EXTRA_ARGS_KEY, {}
+                )
+                if isinstance(sampling_dynamo_args, dict):
+                    sampling_dynamo_args[_M2_NOTICE_EXTRA_ARGS_KEY] = m2_notice
+                else:
+                    logger.warning(
+                        "Ignoring M2 notice because SamplingParams.extra_args[%r] "
+                        "is not an object",
+                        _DYNAMO_EXTRA_ARGS_KEY,
+                    )
     guided_decoding = sampling_options.get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
         sampling_params.structured_outputs = StructuredOutputsParams(

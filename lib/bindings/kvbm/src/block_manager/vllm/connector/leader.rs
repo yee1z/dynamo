@@ -6,6 +6,7 @@ pub mod slot;
 
 use super::*;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
+use dynamo_llm::kv_router::scheduling::{M2_NOTICE_SCHEMA, SpeculativeOnboardingNotice};
 use slot::{ConnectorSlotManager, SlotError, SlotManager, SlotState};
 
 use crate::block_manager::BlockManagerBuilder;
@@ -27,7 +28,10 @@ use dynamo_llm::block_manager::{
 use dynamo_llm::tokens::{SaltHash, TokenBlockSequence, Tokens};
 use dynamo_runtime::config::environment_names::kvbm as env_kvbm;
 use std::sync::{Arc, OnceLock};
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 use tokio;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -656,9 +660,62 @@ impl Leader for KvConnectorLeader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_speculative_onboarding_notice(
+    notice_json: &str,
+    actual_request_id: &str,
+    actual_worker_id: Option<u64>,
+    actual_dp_rank: u32,
+    actual_model: &str,
+    actual_salt: &str,
+    actual_adapter: Option<&str>,
+) -> Result<SpeculativeOnboardingNotice, &'static str> {
+    let notice: SpeculativeOnboardingNotice =
+        serde_json::from_str(notice_json).map_err(|_| "invalid_schema")?;
+    if notice.schema != M2_NOTICE_SCHEMA {
+        return Err("unsupported_schema");
+    }
+    if notice.request_id != actual_request_id {
+        return Err("request_id_mismatch");
+    }
+    if actual_worker_id != Some(notice.worker_id) {
+        return Err("worker_id_mismatch");
+    }
+    if actual_dp_rank != notice.dp_rank {
+        return Err("dp_rank_mismatch");
+    }
+    if notice.identity.model != actual_model
+        || notice.identity.salt != actual_salt
+        || notice.identity.adapter.as_deref() != actual_adapter
+    {
+        return Err("identity_mismatch");
+    }
+    if notice.predicted_disk_blocks == 0
+        || usize::try_from(notice.predicted_disk_blocks).ok() != Some(notice.block_hashes.len())
+    {
+        return Err("block_hash_bounds");
+    }
+    Ok(notice)
+}
+
+fn record_speculative_onboarding_notice(
+    notices: &mut HashMap<String, SpeculativeOnboardingNotice>,
+    notice: SpeculativeOnboardingNotice,
+) -> Result<&'static str, &'static str> {
+    match notices.get(&notice.request_id) {
+        Some(existing) if existing == &notice => Ok("duplicate"),
+        Some(_) => Err("conflicting_notice"),
+        None => {
+            notices.insert(notice.request_id.clone(), notice);
+            Ok("accepted")
+        }
+    }
+}
+
 #[pyclass]
 pub struct PyKvConnectorLeader {
     connector_leader: Box<dyn Leader>,
+    m2_dry_run_notices: HashMap<String, SpeculativeOnboardingNotice>,
 }
 
 #[pymethods]
@@ -702,7 +759,90 @@ impl PyKvConnectorLeader {
                 consolidator_mode,
             ))
         };
-        Ok(Self { connector_leader })
+        Ok(Self {
+            connector_leader,
+            m2_dry_run_notices: HashMap::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        notice_json,
+        actual_request_id,
+        actual_worker_id,
+        actual_dp_rank,
+        actual_model,
+        actual_salt,
+        actual_adapter,
+        connector_engine_id
+    ))]
+    fn observe_speculative_onboarding_notice(
+        &mut self,
+        notice_json: &str,
+        actual_request_id: &str,
+        actual_worker_id: Option<u64>,
+        actual_dp_rank: u32,
+        actual_model: &str,
+        actual_salt: &str,
+        actual_adapter: Option<String>,
+        connector_engine_id: &str,
+    ) -> String {
+        let reject = |reason: &str| {
+            tracing::warn!(
+                "DYN_M2_TRACE {}",
+                serde_json::json!({
+                    "schema": 1,
+                    "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                    "request_id": actual_request_id,
+                    "component": "connector",
+                    "event": "notice_received",
+                    "connector_engine_id": connector_engine_id,
+                    "disposition": "rejected",
+                    "reason": reason,
+                })
+            );
+            format!("rejected:{reason}")
+        };
+
+        let notice = match validate_speculative_onboarding_notice(
+            notice_json,
+            actual_request_id,
+            actual_worker_id,
+            actual_dp_rank,
+            actual_model,
+            actual_salt,
+            actual_adapter.as_deref(),
+        ) {
+            Ok(notice) => notice,
+            Err(reason) => return reject(reason),
+        };
+
+        let disposition = match record_speculative_onboarding_notice(
+            &mut self.m2_dry_run_notices,
+            notice.clone(),
+        ) {
+            Ok(disposition) => disposition,
+            Err(reason) => return reject(reason),
+        };
+        tracing::info!(
+            "DYN_M2_TRACE {}",
+            serde_json::json!({
+                "schema": 1,
+                "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                "request_id": actual_request_id,
+                "component": "connector",
+                "event": "notice_received",
+                "worker_id": notice.worker_id,
+                "dp_rank": notice.dp_rank,
+                "connector_engine_id": connector_engine_id,
+                "state_version": notice.state_version,
+                "worker_epoch": notice.worker_epoch,
+                "predicted_disk_blocks": notice.predicted_disk_blocks,
+                "block_hashes": &notice.block_hashes,
+                "disposition": disposition,
+            })
+        );
+        disposition.to_string()
     }
 
     fn get_num_new_matched_tokens(
@@ -734,9 +874,12 @@ impl PyKvConnectorLeader {
     }
 
     fn request_finished(&mut self, request_id: &str, block_ids: Vec<BlockId>) -> PyResult<bool> {
-        self.connector_leader
+        let result = self
+            .connector_leader
             .request_finished(request_id.to_string(), block_ids)
-            .map_err(to_pyerr)
+            .map_err(to_pyerr);
+        self.m2_dry_run_notices.remove(request_id);
+        result
     }
 
     fn has_slot(&self, request_id: &str) -> bool {
@@ -750,8 +893,13 @@ impl PyKvConnectorLeader {
     }
 
     fn reset_cache(&mut self, py: Python<'_>) -> PyResult<bool> {
-        py.allow_threads(|| self.connector_leader.reset_cache())
-            .map_err(to_pyerr)
+        let reset = py
+            .allow_threads(|| self.connector_leader.reset_cache())
+            .map_err(to_pyerr)?;
+        if reset {
+            self.m2_dry_run_notices.clear();
+        }
+        Ok(reset)
     }
 }
 
@@ -779,5 +927,108 @@ pub fn parse_kvbm_metrics_port() -> u16 {
             );
             6880
         }
+    }
+}
+
+#[cfg(test)]
+mod m2_notice_tests {
+    use super::*;
+    use dynamo_llm::kv_router::scheduling::{
+        SpeculativeCacheIdentity, SpeculativeOnboardingPolicy,
+    };
+
+    fn notice(request_id: &str) -> SpeculativeOnboardingNotice {
+        SpeculativeOnboardingNotice {
+            schema: M2_NOTICE_SCHEMA,
+            request_id: request_id.to_string(),
+            worker_id: 7,
+            dp_rank: 0,
+            identity: SpeculativeCacheIdentity {
+                model: "model".to_string(),
+                salt: String::new(),
+                adapter: None,
+            },
+            worker_epoch: 2,
+            state_version: 3,
+            state_age_ms: 4,
+            prefix_start_block: 1,
+            block_hashes: vec![11, 12],
+            predicted_disk_blocks: 2,
+            predicted_queue_window_ms: None,
+            estimated_stage_ms: None,
+            deadline_budget_ms: None,
+            policy: SpeculativeOnboardingPolicy::DryRun,
+        }
+    }
+
+    fn validate(value: &str) -> Result<SpeculativeOnboardingNotice, &'static str> {
+        validate_speculative_onboarding_notice(value, "request-1", Some(7), 0, "model", "", None)
+    }
+
+    #[test]
+    fn validates_schema_target_identity_and_hash_bounds() {
+        let valid = serde_json::to_string(&notice("request-1")).unwrap();
+        assert_eq!(validate(&valid), Ok(notice("request-1")));
+        assert_eq!(validate("{}"), Err("invalid_schema"));
+
+        let mut wrong_request = notice("other-request");
+        assert_eq!(
+            validate(&serde_json::to_string(&wrong_request).unwrap()),
+            Err("request_id_mismatch")
+        );
+        wrong_request.request_id = "request-1".to_string();
+        wrong_request.identity.model = "other-model".to_string();
+        assert_eq!(
+            validate(&serde_json::to_string(&wrong_request).unwrap()),
+            Err("identity_mismatch")
+        );
+
+        let mut bad_bounds = notice("request-1");
+        bad_bounds.predicted_disk_blocks = 1;
+        assert_eq!(
+            validate(&serde_json::to_string(&bad_bounds).unwrap()),
+            Err("block_hash_bounds")
+        );
+    }
+
+    #[test]
+    fn missing_or_wrong_dispatch_target_fails_closed() {
+        let value = serde_json::to_string(&notice("request-1")).unwrap();
+        assert_eq!(
+            validate_speculative_onboarding_notice(&value, "request-1", None, 0, "model", "", None,),
+            Err("worker_id_mismatch")
+        );
+        assert_eq!(
+            validate_speculative_onboarding_notice(
+                &value,
+                "request-1",
+                Some(7),
+                1,
+                "model",
+                "",
+                None,
+            ),
+            Err("dp_rank_mismatch")
+        );
+    }
+
+    #[test]
+    fn duplicate_is_idempotent_and_conflict_rejects() {
+        let mut notices = HashMap::new();
+        assert_eq!(
+            record_speculative_onboarding_notice(&mut notices, notice("request-1")),
+            Ok("accepted")
+        );
+        assert_eq!(
+            record_speculative_onboarding_notice(&mut notices, notice("request-1")),
+            Ok("duplicate")
+        );
+        let mut conflict = notice("request-1");
+        conflict.state_version += 1;
+        assert_eq!(
+            record_speculative_onboarding_notice(&mut notices, conflict),
+            Err("conflicting_notice")
+        );
+        assert_eq!(notices.len(), 1);
     }
 }

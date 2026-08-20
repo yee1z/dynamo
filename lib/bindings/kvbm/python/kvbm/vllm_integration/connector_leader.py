@@ -7,6 +7,8 @@ Implementation of vLLM KV cache manager protocol.
 
 from __future__ import annotations
 
+import json
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 from vllm.config import VllmConfig
@@ -40,6 +42,42 @@ if is_dyn_runtime_enabled():
     from dynamo.runtime import DistributedRuntime
 
 
+_DYNAMO_EXTRA_ARGS_KEY = "dynamo"
+_M2_NOTICE_EXTRA_ARGS_KEY = "m2_speculative_onboarding_notice"
+
+
+def _numeric_worker_id(engine_id: str) -> Optional[int]:
+    candidates = (
+        os.environ.get("DYN_FPM_WORKER_ID"),
+        engine_id.rsplit(".", 1)[-1],
+    )
+    for value in candidates:
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return None
+
+
+def _global_dp_rank(vllm_config: "VllmConfig") -> int:
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return 0
+    rank = getattr(parallel_config, "data_parallel_index", None)
+    if rank is None:
+        rank = getattr(parallel_config, "data_parallel_rank", 0) or 0
+    return int(rank)
+
+
+def _served_model(vllm_config: "VllmConfig") -> str:
+    model_config = vllm_config.model_config
+    served = getattr(model_config, "served_model_name", None)
+    if isinstance(served, (list, tuple)):
+        served = served[0] if served else None
+    return str(served or getattr(model_config, "model", ""))
+
+
 class DynamoConnectorMetadata(KVConnectorMetadata):
     def __init__(self, metadata: bytes):
         assert isinstance(metadata, bytes)
@@ -65,6 +103,10 @@ class KvConnectorLeader:
 
         self.drt = drt
         self.vllm_config = vllm_config
+        self.engine_id = engine_id
+        self._m2_worker_id = _numeric_worker_id(engine_id)
+        self._m2_dp_rank = _global_dp_rank(vllm_config)
+        self._m2_model = _served_model(vllm_config)
         world_size = vllm_config.parallel_config.world_size
 
         leader = KvbmLeader(world_size, drt=self.drt)
@@ -137,6 +179,7 @@ class KvConnectorLeader:
                 - `True` if external KV cache tokens will be loaded
                   asynchronously (between scheduler steps).
         """
+        self._observe_speculative_onboarding_notice(request)
         self._create_slot(request)
         return self._connector.get_num_new_matched_tokens(
             request.request_id,
@@ -253,6 +296,33 @@ class KvConnectorLeader:
         return self._connector.reset_cache()
 
     # Utility functions
+
+    def _observe_speculative_onboarding_notice(self, request: Request) -> None:
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None)
+        if not isinstance(extra_args, dict):
+            return
+        dynamo_args = extra_args.get(_DYNAMO_EXTRA_ARGS_KEY)
+        if not isinstance(dynamo_args, dict):
+            return
+        notice = dynamo_args.get(_M2_NOTICE_EXTRA_ARGS_KEY)
+        if notice is None:
+            return
+
+        lora_request = getattr(request, "lora_request", None)
+        adapter = lora_request.lora_name() if lora_request else None
+        cache_salt = getattr(request, "cache_salt", None)
+        actual_salt = "" if cache_salt is None else str(cache_salt)
+        self._connector.observe_speculative_onboarding_notice(
+            json.dumps(notice, separators=(",", ":"), sort_keys=True),
+            request.request_id,
+            self._m2_worker_id,
+            self._m2_dp_rank,
+            self._m2_model,
+            actual_salt,
+            adapter,
+            self.engine_id,
+        )
 
     def _create_slot(self, request: Request) -> None:
         """Create a slot for the request"""

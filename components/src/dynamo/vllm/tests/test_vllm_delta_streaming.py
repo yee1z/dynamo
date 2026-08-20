@@ -113,6 +113,43 @@ def test_build_sampling_params_forces_delta_token_mode():
     assert sampling_params.output_kind == RequestOutputKind.DELTA
 
 
+def test_build_sampling_params_forwards_typed_m2_notice():
+    notice = {
+        "schema": 1,
+        "request_id": "req-1",
+        "worker_id": 7,
+        "dp_rank": 0,
+    }
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+        "extra_args": {
+            "dynamo": {"m2_speculative_onboarding_notice": notice},
+        },
+    }
+
+    sampling_params = build_sampling_params(request, default_sampling_params={})
+
+    assert sampling_params.extra_args == {
+        "dynamo": {"m2_speculative_onboarding_notice": notice}
+    }
+
+
+def test_build_sampling_params_without_m2_notice_preserves_feature_off_payload():
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    sampling_params = build_sampling_params(request, default_sampling_params={})
+
+    assert not sampling_params.extra_args
+
+
 @pytest.mark.asyncio
 async def test_generate_tokens_passes_delta_chunks_without_cumulative_slicing():
     responses = [

@@ -16,12 +16,14 @@ use dynamo_kv_router::{
     protocols::{
         BlockExtraInfo, BlockHashOptions, DpRank, LocalBlockHash, PrefillLoadHint, RouterEvent,
         RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike,
-        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq, compute_seq_hash_for_block,
     },
     scheduling::{
         CacheHitEstimates, CacheIdentity, LowerTierStateLedger, OverlapAnalysis,
-        OverloadedWorkerProvider, ScheduleMode, ScheduleRequest, TieredOverlapRefresher,
-        effective_prefill_tokens, overlap::cache_hit_estimates_from_tiered_matches,
+        OverloadedWorkerProvider, ScheduleMode, ScheduleRequest, SpeculativeOnboardingNotice,
+        TieredOverlapRefresher, effective_prefill_tokens,
+        overlap::cache_hit_estimates_from_tiered_matches, qualify_speculative_onboarding_notice,
+        speculative_onboarding_dry_run_enabled,
     },
 };
 use dynamo_runtime::{
@@ -81,6 +83,7 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         routing_hashes: Option<RoutingDecisionHashes>,
+        speculative_onboarding_notice: Option<Box<SpeculativeOnboardingNotice>>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -572,6 +575,12 @@ where
                 request_id: context_id.map(str::to_string),
             }
         };
+        let m2_dry_run = speculative_onboarding_dry_run_enabled();
+        let m2_request_id = if m2_dry_run {
+            mode.tracked_request_id().map(str::to_string)
+        } else {
+            None
+        };
 
         let isl_tokens = tokens.len();
         let hash_options = BlockHashOptions {
@@ -597,7 +606,8 @@ where
         let seq_hash_elapsed = start.elapsed();
 
         let supports_overlap_refresh = self.scheduler.supports_overlap_refresh();
-        let retain_block_hashes = supports_overlap_refresh || return_routing_hashes;
+        let retain_block_hashes =
+            supports_overlap_refresh || return_routing_hashes || m2_request_id.is_some();
 
         let TieredLookupResult {
             tiered_matches,
@@ -615,15 +625,25 @@ where
         )
         .await?;
 
-        let (block_hashes_for_refresh, routing_block_hashes) = retained_block_hashes
-            .map(|block_hashes| {
-                split_retained_block_hashes(
-                    block_hashes,
-                    supports_overlap_refresh,
-                    return_routing_hashes,
-                )
-            })
-            .unwrap_or((None, None));
+        let m2_sequence_hashes = m2_request_id.as_ref().and_then(|_| {
+            retained_block_hashes
+                .as_deref()
+                .map(compute_seq_hash_for_block)
+        });
+        let (block_hashes_for_refresh, routing_block_hashes) =
+            if supports_overlap_refresh || return_routing_hashes {
+                retained_block_hashes
+                    .map(|block_hashes| {
+                        split_retained_block_hashes(
+                            block_hashes,
+                            supports_overlap_refresh,
+                            return_routing_hashes,
+                        )
+                    })
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
 
         let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
@@ -690,6 +710,59 @@ where
         };
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);
+        let speculative_onboarding_notice = if m2_dry_run {
+            match qualify_speculative_onboarding_notice(
+                m2_request_id.as_deref(),
+                response.best_worker,
+                &expected_identity,
+                &response.selected_worker_state,
+                &response.selected_worker_tiers,
+                m2_sequence_hashes.as_deref(),
+                isl_tokens,
+                self.block_size,
+            ) {
+                Ok(notice) => {
+                    tracing::info!(
+                        "DYN_M2_TRACE {}",
+                        serde_json::json!({
+                            "schema": 1,
+                            "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                            "request_id": &notice.request_id,
+                            "component": "router",
+                            "event": "prefetch_notice",
+                            "worker_id": notice.worker_id,
+                            "dp_rank": notice.dp_rank,
+                            "state_version": notice.state_version,
+                            "worker_epoch": notice.worker_epoch,
+                            "state_age_ms": notice.state_age_ms,
+                            "predicted_disk_blocks": notice.predicted_disk_blocks,
+                            "block_hashes": &notice.block_hashes,
+                            "policy": notice.policy,
+                            "disposition": "dry_run_candidate",
+                        })
+                    );
+                    Some(Box::new(notice))
+                }
+                Err(reason) => {
+                    tracing::info!(
+                        "DYN_M2_TRACE {}",
+                        serde_json::json!({
+                            "schema": 1,
+                            "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                            "request_id": m2_request_id.as_deref().unwrap_or(""),
+                            "component": "router",
+                            "event": "stage_reject",
+                            "worker_id": response.best_worker.worker_id,
+                            "dp_rank": response.best_worker.dp_rank,
+                            "reason": reason.as_str(),
+                        })
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         if let Some(m) = metrics::RoutingOverheadMetrics::get() {
             m.observe(
@@ -731,6 +804,7 @@ where
             effective_overlap_blocks: response.effective_overlap_blocks,
             cached_tokens: response.cached_tokens,
             routing_hashes,
+            speculative_onboarding_notice,
         })
     }
 
