@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -169,6 +171,39 @@ async def test_generate_tokens_passes_delta_chunks_without_cumulative_slicing():
         "completion_tokens": 4,
         "total_tokens": 6,
         "prompt_tokens_details": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_tokens_emits_m2_output_trace_at_legacy_serving_seam(
+    caplog, monkeypatch
+):
+    monkeypatch.setenv("DYN_M2_POLICY", "passive")
+    caplog.set_level(logging.INFO, logger="dynamo.vllm.handlers")
+    responses = [
+        _request_output(
+            [_output([7, 8], finish_reason="length")], prompt_token_ids=[10]
+        )
+    ]
+
+    chunks, _ = await _collect_handler_chunks(responses)
+
+    assert chunks[0]["token_ids"] == [7, 8]
+    records = [
+        record.getMessage().split("DYN_M2_TRACE ", 1)[1]
+        for record in caplog.records
+        if "DYN_M2_TRACE " in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert json.loads(records[0]) == {
+        "schema": 1,
+        "ts_ns": json.loads(records[0])["ts_ns"],
+        "request_id": "req-1",
+        "component": "vllm_handler",
+        "event": "output_token_chunk",
+        "output_index": 0,
+        "token_ids": [7, 8],
+        "finish_reason": "length",
     }
 
 

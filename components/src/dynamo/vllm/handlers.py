@@ -3259,6 +3259,30 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         "index": output_idx,
                         "token_ids": token_ids,
                     }
+                    if os.environ.get("DYN_M2_POLICY", "").lower() in {
+                        "passive",
+                        "naive",
+                        "window_aware",
+                        "window-aware",
+                    }:
+                        logger.info(
+                            "DYN_M2_TRACE %s",
+                            json.dumps(
+                                {
+                                    "schema": 1,
+                                    "ts_ns": time.monotonic_ns(),
+                                    "request_id": request_id,
+                                    "component": "vllm_handler",
+                                    "event": "output_token_chunk",
+                                    "output_index": output_idx,
+                                    "token_ids": token_ids,
+                                    "finish_reason": str(finish_reason)
+                                    if finish_reason
+                                    else None,
+                                },
+                                separators=(",", ":"),
+                            ),
+                        )
                     # Capture the raw routed_experts cheaply here; serialize it
                     # only once on the final chunk (base64-encoding a tensor on
                     # every streamed chunk would be wasted work, since only the

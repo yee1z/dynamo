@@ -10,11 +10,9 @@ and feature gap details.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import tempfile
-import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -490,31 +488,6 @@ class VllmLLMEngine(LLMEngine):
                     "index": output_idx,
                     "token_ids": token_ids,
                 }
-                if os.environ.get("DYN_M2_POLICY", "").lower() in {
-                    "passive",
-                    "naive",
-                    "window_aware",
-                    "window-aware",
-                }:
-                    logger.info(
-                        "DYN_M2_TRACE %s",
-                        json.dumps(
-                            {
-                                "schema": 1,
-                                "ts_ns": time.monotonic_ns(),
-                                "request_id": request_id,
-                                "component": "vllm_engine",
-                                "event": "output_token_chunk",
-                                "output_index": output_idx,
-                                "token_ids": token_ids,
-                                "finish_reason": str(finish_reason)
-                                if finish_reason
-                                else None,
-                            },
-                            separators=(",", ":"),
-                        ),
-                    )
-
                 # `build_sampling_params` forces DELTA output → offset 0.
                 # `fallback_to_first_on_missing=True` matches legacy
                 # vLLM handler: always emit when vLLM returned a dict.
