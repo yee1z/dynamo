@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import inspect
+import json
 import logging
 import math
 import os
@@ -124,6 +125,7 @@ _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
 _DYNAMO_EXTRA_ARGS_KEY: Final = "dynamo"
 _M2_NOTICE_EXTRA_ARGS_KEY: Final = "m2_speculative_onboarding_notice"
+_M2_CONTROL_MAX_BYTES: Final = 1024 * 1024
 _DISTRIBUTED_WEIGHT_UPDATE_RESERVED_KEYS: Final = frozenset(
     {
         "allow_unpaused",
@@ -1541,6 +1543,92 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         except Exception as e:
             logger.warning(f"[RL] liveness_probe failed: {e}")
             return {"status": "error", "alive": False, "message": str(e)}
+
+    async def _m2_speculative_onboarding_ack(self, body: dict) -> dict:
+        """Forward an addressed M2 notice to its EngineCore-owned connector."""
+        if not isinstance(body, dict):
+            return {
+                "status": "ok",
+                "disposition": "rejected",
+                "reason": "invalid_schema",
+            }
+        worker_id = body.get("worker_id")
+        dp_rank = body.get("dp_rank")
+        actual_worker_id = (
+            self.generate_endpoint.connection_id()
+            if self.generate_endpoint is not None
+            else None
+        )
+        if (
+            not isinstance(worker_id, int)
+            or isinstance(worker_id, bool)
+            or worker_id != actual_worker_id
+        ):
+            return {
+                "status": "ok",
+                "disposition": "rejected",
+                "reason": "worker_id_mismatch",
+            }
+        dp_start, dp_size = self.dp_range
+        if (
+            not isinstance(dp_rank, int)
+            or isinstance(dp_rank, bool)
+            or not dp_start <= dp_rank < dp_start + dp_size
+        ):
+            return {
+                "status": "ok",
+                "disposition": "rejected",
+                "reason": "dp_rank_mismatch",
+            }
+
+        socket_dir = os.getenv("DYN_M2_CONTROL_SOCKET_DIR", "/tmp")
+        socket_path = os.path.join(
+            socket_dir, f"dynamo-m2-control-{worker_id}-{dp_rank}.sock"
+        )
+        try:
+            timeout_ms = max(1, int(os.getenv("DYN_M2_CONTROL_TIMEOUT_MS", "1000")))
+        except ValueError:
+            timeout_ms = 1000
+        timeout = timeout_ms / 1000
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(socket_path), timeout=timeout
+            )
+            payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+            if len(payload) > _M2_CONTROL_MAX_BYTES:
+                return {
+                    "status": "ok",
+                    "disposition": "rejected",
+                    "reason": "frame_too_large",
+                }
+            writer.write(payload + b"\n")
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+            response = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not response or len(response) > _M2_CONTROL_MAX_BYTES:
+                raise ValueError("invalid acknowledgement frame")
+            ack = json.loads(response)
+            if not isinstance(ack, dict):
+                raise ValueError("acknowledgement is not an object")
+            return ack
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as error:
+            logger.warning("M2 connector control failed closed: %s", error)
+            return {
+                "status": "ok",
+                "disposition": "rejected",
+                "reason": "control_unavailable",
+            }
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+
+    async def m2_speculative_onboarding(self, body: dict) -> AsyncIterator[dict]:
+        """Stream the single typed ACK required by the runtime endpoint contract."""
+        yield await self._m2_speculative_onboarding_ack(body)
 
     async def pause_generation(self, body: dict) -> dict:
         """Pause generation before a weight update."""

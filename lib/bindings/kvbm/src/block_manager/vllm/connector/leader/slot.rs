@@ -20,11 +20,9 @@ use dynamo_llm::{
     tokens::{SequenceHash, TokenBlock, compute_hash_v2},
 };
 use dynamo_runtime::nvtx;
-use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 #[cfg(feature = "phase-c-nvtx")]
-use dynamo_runtime::nvtx::{
-    CATEGORY_CONNECTOR, PhaseCPayload, PhaseCRange, TIER_UNKNOWN,
-};
+use dynamo_runtime::nvtx::{CATEGORY_CONNECTOR, PhaseCPayload, PhaseCRange, TIER_UNKNOWN};
+use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::block_manager::cache_stats::CacheStatsTracker;
@@ -52,7 +50,10 @@ fn phase_d_state_trace_enabled() -> bool {
 }
 
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: `ts` is writable and CLOCK_MONOTONIC is shared by host processes.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     debug_assert_eq!(rc, 0);
@@ -585,9 +586,12 @@ impl VllmConnectorSlot {
                 bytes.extend_from_slice(&token.to_le_bytes());
             }
             let block_hash = compute_hash_v2(&bytes, ROUTER_HASH_SEED);
-            let sequence_hash = sequence_hashes.last().copied().map_or(block_hash, |parent| {
-                next_router_sequence_hash(parent, block_hash)
-            });
+            let sequence_hash = sequence_hashes
+                .last()
+                .copied()
+                .map_or(block_hash, |parent| {
+                    next_router_sequence_hash(parent, block_hash)
+                });
             sequence_hashes.push(sequence_hash);
         }
         sequence_hashes
@@ -1249,9 +1253,12 @@ impl Slot for VllmConnectorSlot {
         if m1_trace_enabled() {
             tracing::info!(
                 "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"connector\",\"event\":\"connector_match_start\",\"num_computed_tokens\":{},\"lookup_blocks\":{}}}",
-                monotonic_ns(), canonical_request_id(&self.request_id),
-                request_key, request_key_hex,
-                num_computed_tokens, blocks_to_lookup.len()
+                monotonic_ns(),
+                canonical_request_id(&self.request_id),
+                request_key,
+                request_key_hex,
+                num_computed_tokens,
+                blocks_to_lookup.len()
             );
         }
 
@@ -2095,7 +2102,11 @@ async fn process_onboard_request(
     let operation_id = &onboard_req.operation_id;
     let source_pool = onboard_req.src_blocks.storage_pool();
     let block_count = onboard_req.src_blocks.len();
-    let direction = if source_pool == BlockTransferPool::Disk { "d2d" } else { "h2d" };
+    let direction = if source_pool == BlockTransferPool::Disk {
+        "d2d"
+    } else {
+        "h2d"
+    };
 
     // extract source block ids
     let src_block_ids = onboard_req.src_blocks.block_ids();
@@ -2127,8 +2138,15 @@ async fn process_onboard_request(
         let transfer_key = nvtx::transfer_key(Some(&transfer_id)).unwrap_or(0);
         tracing::info!(
             "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_id\":{:?},\"transfer_key\":{},\"transfer_key_hex\":{:?},\"component\":\"physical\",\"event\":\"transfer_start\",\"direction\":{:?},\"blocks\":{}}}",
-            monotonic_ns(), canonical_id, request_key, nvtx::key_hex(request_key),
-            transfer_id, transfer_key, nvtx::key_hex(transfer_key), direction, block_count
+            monotonic_ns(),
+            canonical_id,
+            request_key,
+            nvtx::key_hex(request_key),
+            transfer_id,
+            transfer_key,
+            nvtx::key_hex(transfer_key),
+            direction,
+            block_count
         );
     }
     let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
@@ -2142,8 +2160,16 @@ async fn process_onboard_request(
         let transfer_key = nvtx::transfer_key(Some(&transfer_id)).unwrap_or(0);
         tracing::info!(
             "DYN_M1_TRACE {{\"schema\":1,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_id\":{:?},\"transfer_key\":{},\"transfer_key_hex\":{:?},\"component\":\"physical\",\"event\":\"transfer_end\",\"direction\":{:?},\"blocks\":{},\"status\":{:?}}}",
-            monotonic_ns(), canonical_id, request_key, nvtx::key_hex(request_key),
-            transfer_id, transfer_key, nvtx::key_hex(transfer_key), direction, block_count, status
+            monotonic_ns(),
+            canonical_id,
+            request_key,
+            nvtx::key_hex(request_key),
+            transfer_id,
+            transfer_key,
+            nvtx::key_hex(transfer_key),
+            direction,
+            block_count,
+            status
         );
     }
     match result {
@@ -2369,9 +2395,12 @@ mod connector_tests {
                 bytes.extend_from_slice(&token.to_le_bytes());
             }
             let local = compute_hash_v2(&bytes, ROUTER_HASH_SEED);
-            expected.push(expected.last().copied().map_or(local, |parent| {
-                next_router_sequence_hash(parent, local)
-            }));
+            expected.push(
+                expected
+                    .last()
+                    .copied()
+                    .map_or(local, |parent| next_router_sequence_hash(parent, local)),
+            );
         }
 
         slot.apply_scheduler_output(&[], &blocks, 0, 96, None, None)

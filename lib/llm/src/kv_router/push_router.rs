@@ -44,11 +44,14 @@ use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
+const M2_CONTROL_ENDPOINT: &str = "m2_speculative_onboarding";
+type M2ControlRouter = PushRouter<serde_json::Value, Annotated<serde_json::Value>>;
 
 pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter>,
     affinity: Option<AffinityCoordinator>,
+    m2_control_router: tokio::sync::OnceCell<M2ControlRouter>,
 }
 
 impl KvPushRouter {
@@ -76,7 +79,58 @@ impl KvPushRouter {
             inner,
             chooser,
             affinity,
+            m2_control_router: tokio::sync::OnceCell::new(),
         })
+    }
+
+    async fn m2_control_router(&self) -> Result<&M2ControlRouter, Error> {
+        self.m2_control_router
+            .get_or_try_init(|| async {
+                let endpoint = self
+                    .inner
+                    .client
+                    .endpoint
+                    .component()
+                    .endpoint(M2_CONTROL_ENDPOINT);
+                let client = endpoint.client().await?;
+                let timeout = m2_control_timeout();
+                tokio::time::timeout(timeout, client.wait_for_instances())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("M2 control discovery timed out"))??;
+                M2ControlRouter::from_client_no_fault_detection(client, Default::default()).await
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn dispatch_m2_control(
+        &self,
+        notice: &SpeculativeOnboardingNotice,
+    ) -> Result<String, Error> {
+        let router = self.m2_control_router().await?;
+        let input: SingleIn<serde_json::Value> = serde_json::to_value(notice)?.into();
+        let mut stream = tokio::time::timeout(
+            m2_control_timeout(),
+            router.dispatch_exact(input, notice.worker_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("M2 control dispatch timed out"))??;
+        let response = tokio::time::timeout(m2_control_timeout(), stream.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("M2 control acknowledgement timed out"))?
+            .ok_or_else(|| anyhow::anyhow!("M2 control returned no acknowledgement"))?;
+        let value = response
+            .into_result()?
+            .ok_or_else(|| anyhow::anyhow!("M2 control acknowledgement has no data"))?;
+        let status = value.get("status").and_then(serde_json::Value::as_str);
+        let disposition = value
+            .get("disposition")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("M2 control acknowledgement has no disposition"))?;
+        if status != Some("ok") {
+            anyhow::bail!("M2 control returned non-ok status");
+        }
+        Ok(disposition.to_string())
     }
 
     async fn select_request(
@@ -291,6 +345,35 @@ impl KvPushRouter {
 
         let (mut backend_input, context) = request.into_parts();
         if let Some(notice) = selection.speculative_onboarding_notice.as_ref() {
+            match self.dispatch_m2_control(notice).await {
+                Ok(disposition) => tracing::info!(
+                    "DYN_M2_TRACE {}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                        "request_id": &notice.request_id,
+                        "component": "router",
+                        "event": "control_ack",
+                        "worker_id": notice.worker_id,
+                        "dp_rank": notice.dp_rank,
+                        "disposition": disposition,
+                    })
+                ),
+                Err(error) => tracing::warn!(
+                    "DYN_M2_TRACE {}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                        "request_id": &notice.request_id,
+                        "component": "router",
+                        "event": "stage_reject",
+                        "worker_id": notice.worker_id,
+                        "dp_rank": notice.dp_rank,
+                        "reason": "control_unavailable",
+                        "detail": error.to_string(),
+                    })
+                ),
+            }
             let disposition = if notice.worker_id != selection.instance_id
                 || notice.dp_rank != selection.dp_rank
             {
@@ -465,6 +548,15 @@ impl KvPushRouter {
         };
         Ok((metadata, operation.into_stream(stream, close_on_finish)))
     }
+}
+
+fn m2_control_timeout() -> Duration {
+    std::env::var("DYN_M2_CONTROL_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(1))
 }
 
 fn attach_speculative_onboarding_notice(

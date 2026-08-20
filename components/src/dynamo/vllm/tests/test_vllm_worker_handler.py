@@ -1679,3 +1679,64 @@ class TestRLAdminRouteHardening:
         await guard.abort()
         assert len(escalated) == 1
         assert isinstance(escalated[0], EngineDeadError)
+
+
+class TestM2SpeculativeOnboardingControl:
+    @pytest.mark.asyncio
+    async def test_exact_target_forwards_to_dp_connector_socket(self, monkeypatch):
+        handler = _make_handler()
+        handler.generate_endpoint = MagicMock()
+        handler.generate_endpoint.connection_id.return_value = 7
+        handler.dp_range = (0, 2)
+        reader = MagicMock()
+        reader.readline = AsyncMock(
+            return_value=b'{"status":"ok","disposition":"accepted"}\n'
+        )
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
+        open_socket = AsyncMock(return_value=(reader, writer))
+        monkeypatch.setattr(asyncio, "open_unix_connection", open_socket)
+
+        responses = [
+            response
+            async for response in handler.m2_speculative_onboarding(
+                {
+                    "schema": 1,
+                    "request_id": "request-1",
+                    "worker_id": 7,
+                    "dp_rank": 1,
+                }
+            )
+        ]
+
+        assert responses == [{"status": "ok", "disposition": "accepted"}]
+        open_socket.assert_awaited_once_with("/tmp/dynamo-m2-control-7-1.sock")
+        assert writer.write.call_args.args[0].endswith(b"\n")
+        writer.close.assert_called_once_with()
+        writer.wait_closed.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_wrong_worker_fails_closed_without_opening_socket(self, monkeypatch):
+        handler = _make_handler()
+        handler.generate_endpoint = MagicMock()
+        handler.generate_endpoint.connection_id.return_value = 7
+        handler.dp_range = (0, 1)
+        open_socket = AsyncMock()
+        monkeypatch.setattr(asyncio, "open_unix_connection", open_socket)
+
+        responses = [
+            response
+            async for response in handler.m2_speculative_onboarding(
+                {
+                    "schema": 1,
+                    "request_id": "request-1",
+                    "worker_id": 8,
+                    "dp_rank": 0,
+                }
+            )
+        ]
+
+        assert responses[0]["disposition"] == "rejected"
+        assert responses[0]["reason"] == "worker_id_mismatch"
+        open_socket.assert_not_awaited()

@@ -47,6 +47,17 @@ from .publisher import StatLoggerFactory
 
 logger = logging.getLogger(__name__)
 
+_M2_CONTROL_ENDPOINT = "m2_speculative_onboarding"
+
+
+def _m2_dry_run_enabled() -> bool:
+    return os.getenv("DYN_M2_DRY_RUN_NOTICE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 # (engine_client, vllm_config, default_sampling_params, prometheus_temp_dir, component_gauges)
 # component_gauges is None on the embedding-worker path: pooling engines
 # have no KV cache / scheduler gauges, so setup_vllm_engine() skips the
@@ -394,6 +405,13 @@ class WorkerFactory:
             if config.enable_rl
             else None
         )
+        m2_control_endpoint = (
+            runtime.endpoint(
+                f"{config.namespace}.{config.component}.{_M2_CONTROL_ENDPOINT}"
+            )
+            if _m2_dry_run_enabled()
+            else None
+        )
 
         shutdown_endpoints[:] = [
             generate_endpoint,
@@ -401,6 +419,8 @@ class WorkerFactory:
         ]
         if rl_endpoint is not None:
             shutdown_endpoints.append(rl_endpoint)
+        if m2_control_endpoint is not None:
+            shutdown_endpoints.append(m2_control_endpoint)
 
         lora_enabled = config.engine_args.enable_lora
         if lora_enabled:
@@ -632,6 +652,14 @@ class WorkerFactory:
                     )
                 )
 
+            if m2_control_endpoint is not None:
+                serve_tasks.append(
+                    m2_control_endpoint.serve_endpoint(
+                        handler.m2_speculative_onboarding,
+                        metrics_labels=model_metrics_labels,
+                    )
+                )
+
             if lora_enabled:
                 serve_tasks.extend(
                     [
@@ -680,6 +708,13 @@ class WorkerFactory:
         rl_endpoint = (
             runtime.endpoint(f"{config.namespace}.{config.component}.rl")
             if config.enable_rl
+            else None
+        )
+        m2_control_endpoint = (
+            runtime.endpoint(
+                f"{config.namespace}.{config.component}.{_M2_CONTROL_ENDPOINT}"
+            )
+            if _m2_dry_run_enabled()
             else None
         )
 
@@ -790,6 +825,8 @@ class WorkerFactory:
         shutdown_endpoints[:] = [generate_endpoint, clear_endpoint, perf_endpoint]
         if rl_endpoint is not None:
             shutdown_endpoints.append(rl_endpoint)
+        if m2_control_endpoint is not None:
+            shutdown_endpoints.append(m2_control_endpoint)
 
         # Prefill workers expose no OpenAI surface — the role is carried by
         # `worker_type=Prefill`. We register the legacy `ModelType.Prefill`
@@ -854,6 +891,13 @@ class WorkerFactory:
                 serve_tasks.append(
                     rl_endpoint.serve_endpoint(
                         handler.rl_dispatch,
+                        metrics_labels=prefill_metrics_labels,
+                    )
+                )
+            if m2_control_endpoint is not None:
+                serve_tasks.append(
+                    m2_control_endpoint.serve_endpoint(
+                        handler.m2_speculative_onboarding,
                         metrics_labels=prefill_metrics_labels,
                     )
                 )

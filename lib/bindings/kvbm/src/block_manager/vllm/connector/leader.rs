@@ -27,12 +27,16 @@ use dynamo_llm::block_manager::{
 };
 use dynamo_llm::tokens::{SaltHash, TokenBlockSequence, Tokens};
 use dynamo_runtime::config::environment_names::kvbm as env_kvbm;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
 };
 use tokio;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -717,16 +721,258 @@ fn record_speculative_onboarding_notice(
     }
 }
 
+const DYN_M2_DRY_RUN_NOTICE: &str = "DYN_M2_DRY_RUN_NOTICE";
+const M2_CONTROL_MAX_BYTES: u64 = 1024 * 1024;
+
+fn m2_dry_run_enabled() -> bool {
+    std::env::var(DYN_M2_DRY_RUN_NOTICE)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+fn m2_control_socket_path(worker_id: u64, dp_rank: u32) -> PathBuf {
+    let directory = std::env::var_os("DYN_M2_CONTROL_SOCKET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    directory.join(format!("dynamo-m2-control-{worker_id}-{dp_rank}.sock"))
+}
+
+#[derive(Debug, Serialize)]
+struct M2ControlAck<'a> {
+    schema: u16,
+    status: &'a str,
+    disposition: &'a str,
+    request_id: &'a str,
+    worker_id: u64,
+    dp_rank: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
+#[derive(Debug)]
+struct M2ControlTarget {
+    worker_id: u64,
+    dp_rank: u32,
+    model: String,
+    connector_engine_id: String,
+}
+
+fn observe_m2_control_notice(
+    notice_json: &str,
+    target: &M2ControlTarget,
+    notices: &Mutex<HashMap<String, SpeculativeOnboardingNotice>>,
+) -> String {
+    let notice = match serde_json::from_str::<SpeculativeOnboardingNotice>(notice_json) {
+        Ok(notice) => notice,
+        Err(_) => {
+            return serde_json::to_string(&M2ControlAck {
+                schema: M2_NOTICE_SCHEMA,
+                status: "ok",
+                disposition: "rejected",
+                request_id: "",
+                worker_id: target.worker_id,
+                dp_rank: target.dp_rank,
+                reason: Some("invalid_schema"),
+            })
+            .expect("M2 control rejection is serializable");
+        }
+    };
+    let reject = |reason: &'static str| {
+        serde_json::to_string(&M2ControlAck {
+            schema: M2_NOTICE_SCHEMA,
+            status: "ok",
+            disposition: "rejected",
+            request_id: &notice.request_id,
+            worker_id: target.worker_id,
+            dp_rank: target.dp_rank,
+            reason: Some(reason),
+        })
+        .expect("M2 control rejection is serializable")
+    };
+    if notice.schema != M2_NOTICE_SCHEMA {
+        return reject("unsupported_schema");
+    }
+    if uuid::Uuid::parse_str(&notice.request_id).is_err() {
+        return reject("request_id_mismatch");
+    }
+    if notice.worker_id != target.worker_id {
+        return reject("worker_id_mismatch");
+    }
+    if notice.dp_rank != target.dp_rank {
+        return reject("dp_rank_mismatch");
+    }
+    if notice.identity.model != target.model {
+        return reject("identity_mismatch");
+    }
+    if notice.predicted_disk_blocks == 0
+        || usize::try_from(notice.predicted_disk_blocks).ok() != Some(notice.block_hashes.len())
+    {
+        return reject("block_hash_bounds");
+    }
+
+    let disposition = match notices.lock() {
+        Ok(mut notices) => match record_speculative_onboarding_notice(&mut notices, notice.clone())
+        {
+            Ok(disposition) => disposition,
+            Err(reason) => return reject(reason),
+        },
+        Err(_) => return reject("registry_poisoned"),
+    };
+    tracing::info!(
+        "DYN_M2_TRACE {}",
+        serde_json::json!({
+            "schema": 1,
+            "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+            "request_id": notice.request_id,
+            "component": "connector",
+            "event": "notice_received",
+            "transport": "addressed_control",
+            "worker_id": notice.worker_id,
+            "dp_rank": notice.dp_rank,
+            "connector_engine_id": target.connector_engine_id,
+            "state_version": notice.state_version,
+            "worker_epoch": notice.worker_epoch,
+            "predicted_disk_blocks": notice.predicted_disk_blocks,
+            "block_hashes": &notice.block_hashes,
+            "disposition": disposition,
+        })
+    );
+    serde_json::to_string(&M2ControlAck {
+        schema: M2_NOTICE_SCHEMA,
+        status: "ok",
+        disposition,
+        request_id: &notice.request_id,
+        worker_id: target.worker_id,
+        dp_rank: target.dp_rank,
+        reason: None,
+    })
+    .expect("M2 control acknowledgement is serializable")
+}
+
+#[derive(Debug)]
+struct M2ControlServer {
+    cancel: CancellationToken,
+    socket_path: PathBuf,
+}
+
+impl M2ControlServer {
+    fn start(
+        handle: &Handle,
+        target: M2ControlTarget,
+        notices: Arc<Mutex<HashMap<String, SpeculativeOnboardingNotice>>>,
+    ) -> anyhow::Result<Self> {
+        let socket_path = m2_control_socket_path(target.worker_id, target.dp_rank);
+        Self::start_at(handle, target, notices, socket_path)
+    }
+
+    fn start_at(
+        handle: &Handle,
+        target: M2ControlTarget,
+        notices: Arc<Mutex<HashMap<String, SpeculativeOnboardingNotice>>>,
+        socket_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        if Path::new(&socket_path).exists() {
+            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+                anyhow::bail!(
+                    "M2 control socket is already active: {}",
+                    socket_path.display()
+                );
+            }
+            std::fs::remove_file(&socket_path)?;
+        }
+        let listener = {
+            let _runtime_guard = handle.enter();
+            UnixListener::bind(&socket_path)?
+        };
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let target = Arc::new(target);
+        handle.spawn(async move {
+            loop {
+                let (stream, _) = tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            tracing::error!(%error, "M2 control accept failed");
+                            break;
+                        }
+                    },
+                };
+                let target = target.clone();
+                let notices = notices.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader).take(M2_CONTROL_MAX_BYTES + 1);
+                    let mut request = Vec::new();
+                    let result = reader.read_until(b'\n', &mut request).await;
+                    let response = match result {
+                        Ok(read)
+                            if read > 0
+                                && read as u64 <= M2_CONTROL_MAX_BYTES
+                                && request.last() == Some(&b'\n') =>
+                        {
+                            request.pop();
+                            match std::str::from_utf8(&request) {
+                                Ok(request) => {
+                                    observe_m2_control_notice(request, &target, &notices)
+                                }
+                                Err(_) => serde_json::json!({
+                                    "schema": M2_NOTICE_SCHEMA,
+                                    "status": "ok",
+                                    "disposition": "rejected",
+                                    "reason": "invalid_utf8",
+                                })
+                                .to_string(),
+                            }
+                        }
+                        _ => serde_json::json!({
+                            "schema": M2_NOTICE_SCHEMA,
+                            "status": "ok",
+                            "disposition": "rejected",
+                            "reason": "invalid_frame",
+                        })
+                        .to_string(),
+                    };
+                    if let Err(error) = writer.write_all(response.as_bytes()).await {
+                        tracing::warn!(%error, "M2 control acknowledgement write failed");
+                        return;
+                    }
+                    let _ = writer.write_all(b"\n").await;
+                });
+            }
+        });
+        Ok(Self {
+            cancel,
+            socket_path,
+        })
+    }
+}
+
+impl Drop for M2ControlServer {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
 #[pyclass]
 pub struct PyKvConnectorLeader {
     connector_leader: Box<dyn Leader>,
-    m2_dry_run_notices: HashMap<String, SpeculativeOnboardingNotice>,
+    m2_dry_run_notices: Arc<Mutex<HashMap<String, SpeculativeOnboardingNotice>>>,
+    _m2_control_server: Option<M2ControlServer>,
 }
 
 #[pymethods]
 impl PyKvConnectorLeader {
     #[new]
-    #[pyo3(signature = (worker_id, drt, page_size, leader, consolidator_vllm_endpoint=None, consolidator_output_endpoint=None, consolidator_mode=None))]
+    #[pyo3(signature = (worker_id, drt, page_size, leader, consolidator_vllm_endpoint=None, consolidator_output_endpoint=None, consolidator_mode=None, m2_worker_id=None, m2_dp_rank=None, m2_model=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: String,
         drt: Option<PyObject>,
@@ -735,6 +981,9 @@ impl PyKvConnectorLeader {
         consolidator_vllm_endpoint: Option<String>,
         consolidator_output_endpoint: Option<String>,
         consolidator_mode: Option<String>,
+        m2_worker_id: Option<u64>,
+        m2_dp_rank: Option<u32>,
+        m2_model: Option<String>,
     ) -> PyResult<Self> {
         let _ = &drt; // drt is currently un-used in leader
 
@@ -745,6 +994,7 @@ impl PyKvConnectorLeader {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let connector_engine_id = worker_id.clone();
         let connector_leader: Box<dyn Leader> = if enable_kvbm_record {
             Box::new(recorder::KvConnectorLeaderRecorder::new(
                 worker_id,
@@ -764,9 +1014,36 @@ impl PyKvConnectorLeader {
                 consolidator_mode,
             ))
         };
+        let m2_dry_run_notices = Arc::new(Mutex::new(HashMap::new()));
+        let m2_control_server = if m2_dry_run_enabled() {
+            match (m2_worker_id, m2_dp_rank, m2_model) {
+                (Some(worker_id), Some(dp_rank), Some(model)) => M2ControlServer::start(
+                    &get_current_tokio_handle(),
+                    M2ControlTarget {
+                        worker_id,
+                        dp_rank,
+                        model,
+                        connector_engine_id,
+                    },
+                    m2_dry_run_notices.clone(),
+                )
+                .map(Some)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "M2 control server failed to start; falling back passive");
+                    None
+                }),
+                _ => {
+                    tracing::warn!("M2 dry-run enabled without a complete connector target; control disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             connector_leader,
-            m2_dry_run_notices: HashMap::new(),
+            m2_dry_run_notices,
+            _m2_control_server: m2_control_server,
         })
     }
 
@@ -822,12 +1099,14 @@ impl PyKvConnectorLeader {
             Err(reason) => return reject(reason),
         };
 
-        let disposition = match record_speculative_onboarding_notice(
-            &mut self.m2_dry_run_notices,
-            notice.clone(),
-        ) {
-            Ok(disposition) => disposition,
-            Err(reason) => return reject(reason),
+        let disposition = match self.m2_dry_run_notices.lock() {
+            Ok(mut notices) => {
+                match record_speculative_onboarding_notice(&mut notices, notice.clone()) {
+                    Ok(disposition) => disposition,
+                    Err(reason) => return reject(reason),
+                }
+            }
+            Err(_) => return reject("registry_poisoned"),
         };
         tracing::info!(
             "DYN_M2_TRACE {}",
@@ -858,7 +1137,10 @@ impl PyKvConnectorLeader {
         num_computed_tokens: usize,
     ) -> PyResult<(usize, bool)> {
         if let Some(canonical_request_id) = dynamo_runtime::nvtx::canonical_uuid(&request_id)
-            && self.m2_dry_run_notices.contains_key(&canonical_request_id)
+            && self
+                .m2_dry_run_notices
+                .lock()
+                .is_ok_and(|notices| notices.contains_key(&canonical_request_id))
         {
             tracing::info!(
                 "DYN_M2_TRACE {}",
@@ -899,7 +1181,9 @@ impl PyKvConnectorLeader {
             .connector_leader
             .request_finished(request_id.to_string(), block_ids)
             .map_err(to_pyerr);
-        self.m2_dry_run_notices.remove(request_id);
+        if let Ok(mut notices) = self.m2_dry_run_notices.lock() {
+            notices.remove(request_id);
+        }
         result
     }
 
@@ -917,8 +1201,8 @@ impl PyKvConnectorLeader {
         let reset = py
             .allow_threads(|| self.connector_leader.reset_cache())
             .map_err(to_pyerr)?;
-        if reset {
-            self.m2_dry_run_notices.clear();
+        if reset && let Ok(mut notices) = self.m2_dry_run_notices.lock() {
+            notices.clear();
         }
         Ok(reset)
     }
@@ -1065,5 +1349,43 @@ mod m2_notice_tests {
             Err("conflicting_notice")
         );
         assert_eq!(notices.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn addressed_control_socket_acknowledges_before_demand() {
+        let socket_path = PathBuf::from(format!(
+            "/tmp/dynamo-m2-control-test-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let notices = Arc::new(Mutex::new(HashMap::new()));
+        let server = M2ControlServer::start_at(
+            &Handle::current(),
+            M2ControlTarget {
+                worker_id: 7,
+                dp_rank: 0,
+                model: "model".to_string(),
+                connector_engine_id: "engine".to_string(),
+            },
+            notices.clone(),
+            socket_path.clone(),
+        )
+        .unwrap();
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let request = serde_json::to_vec(&notice(REQUEST_ID)).unwrap();
+        stream.write_all(&request).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["disposition"], "accepted");
+        assert!(notices.lock().unwrap().contains_key(REQUEST_ID));
+
+        drop(server);
+        assert!(!socket_path.exists());
     }
 }

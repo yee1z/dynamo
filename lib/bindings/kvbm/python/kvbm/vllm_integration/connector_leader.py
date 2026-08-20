@@ -143,6 +143,9 @@ class KvConnectorLeader:
                 consolidator_vllm_endpoint=consolidator_vllm_endpoint,
                 consolidator_output_endpoint=consolidator_output_endpoint,
                 consolidator_mode=consolidator_mode,
+                m2_worker_id=self._m2_worker_id,
+                m2_dp_rank=self._m2_dp_rank,
+                m2_model=self._m2_model,
             )
         else:
             # No kv event consolidator - pass None to Rust
@@ -154,6 +157,9 @@ class KvConnectorLeader:
                 consolidator_vllm_endpoint=None,
                 consolidator_output_endpoint=None,
                 consolidator_mode=None,
+                m2_worker_id=self._m2_worker_id,
+                m2_dp_rank=self._m2_dp_rank,
+                m2_model=self._m2_model,
             )
 
     # KV Connector
