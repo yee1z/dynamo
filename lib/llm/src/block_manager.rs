@@ -150,6 +150,15 @@ impl<Locality: LocalityProvider, Metadata: BlockMetadata> KvBlockManager<Localit
     ) -> oneshot::Receiver<BlockResult<DeviceStorage, Locality, Metadata>> {
         self.state.onboard_blocks(blocks, targets)
     }
+
+    /// Stage registered disk blocks into this manager's pinned-host pool.
+    pub fn stage_disk_blocks(
+        &self,
+        blocks: Vec<ImmutableBlock<DiskStorage, Locality, Metadata>>,
+        targets: Option<Vec<MutableBlock<PinnedStorage, Locality, Metadata>>>,
+    ) -> oneshot::Receiver<BlockResult<PinnedStorage, Locality, Metadata>> {
+        self.state.stage_disk_blocks(blocks, targets)
+    }
 }
 
 fn build_cancel_token(config: &mut KvBlockManagerConfig) -> Arc<CancelOnLastDrop> {

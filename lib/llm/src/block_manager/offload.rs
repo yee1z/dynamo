@@ -152,6 +152,8 @@ pub struct OffloadManager<Locality: LocalityProvider, Metadata: BlockMetadata> {
         mpsc::UnboundedSender<OnboardRequest<PinnedStorage, DeviceStorage, Locality, Metadata>>,
     disk_onboard_tx:
         mpsc::UnboundedSender<OnboardRequest<DiskStorage, DeviceStorage, Locality, Metadata>>,
+    disk_to_host_tx:
+        mpsc::UnboundedSender<OnboardRequest<DiskStorage, PinnedStorage, Locality, Metadata>>,
 
     /// An incrementing counter for offloaded blocks. Within the same priority, blocks with lower tick values are processed first.
     tick: Arc<AtomicU64>,
@@ -177,6 +179,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
 
         let (host_onboard_tx, host_onboard_rx) = mpsc::unbounded_channel();
         let (disk_onboard_tx, disk_onboard_rx) = mpsc::unbounded_channel();
+        let (disk_to_host_tx, disk_to_host_rx) = mpsc::unbounded_channel();
 
         let this = Arc::new(Self {
             disk,
@@ -187,6 +190,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             device_to_disk_offload_tx,
             host_onboard_tx,
             disk_onboard_tx,
+            disk_to_host_tx,
             tick: Arc::new(AtomicU64::new(0)),
             bypass_cpu_mem: config.bypass_cpu_mem,
         });
@@ -353,6 +357,33 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             |_| disk_to_device_task,
             config.cancellation_token.clone(),
             "Disk -> Device onboarding worker",
+            &config.async_rt_handle,
+        )?
+        .detach();
+
+        // Disk -> Host staging. This deliberately uses the same pools, transfer
+        // context, registration path, and cancellation owner as demand onboarding.
+        let disk_to_host_task = OffloadManager::onboard_worker(
+            this.disk.clone(),
+            this.host.clone(),
+            disk_to_host_rx,
+            Arc::new(TransferBatcher::new(
+                LocalTransferManager::new(
+                    transfer_ctx.clone(),
+                    max_concurrent_transfers,
+                    &config.async_rt_handle,
+                    config.cancellation_token.clone(),
+                )?,
+                max_transfer_batch_size,
+                &config.async_rt_handle,
+                config.cancellation_token.clone(),
+            )),
+            config.cancellation_token.clone(),
+        );
+        CriticalTaskExecutionHandle::new_with_runtime(
+            |_| disk_to_host_task,
+            config.cancellation_token.clone(),
+            "Disk -> Host staging worker",
             &config.async_rt_handle,
         )?
         .detach();
@@ -723,6 +754,46 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             .unwrap();
         }
 
+        rx
+    }
+
+    pub fn stage_disk_to_host(
+        &self,
+        blocks: Vec<ImmutableBlock<DiskStorage, Locality, Metadata>>,
+        targets: Option<Vec<MutableBlock<PinnedStorage, Locality, Metadata>>>,
+    ) -> oneshot::Receiver<BlockResult<PinnedStorage, Locality, Metadata>> {
+        let (tx, rx) = oneshot::channel();
+        if blocks
+            .iter()
+            .any(|block| !matches!(block.state(), BlockState::Registered(_, _)))
+        {
+            let _ = tx.send(Err(BlockPoolError::BlockError(BlockError::InvalidState(
+                "Block is not registered.".to_string(),
+            ))));
+            return rx;
+        }
+        if targets
+            .as_ref()
+            .is_some_and(|targets| targets.len() != blocks.len())
+        {
+            let _ = tx.send(Err(BlockPoolError::BlockError(BlockError::Other(
+                anyhow::anyhow!("Number of targets does not match number of blocks."),
+            ))));
+            return rx;
+        }
+        if blocks.is_empty() {
+            let _ = tx.send(Ok(Vec::new()));
+            return rx;
+        }
+        if let Err(error) = self
+            .disk_to_host_tx
+            .send(OnboardRequest::new(blocks, tx, targets))
+        {
+            let _ = error
+                .0
+                .response_tx
+                .send(Err(BlockPoolError::ProgressEngineShutdown));
+        }
         rx
     }
 }
@@ -1589,6 +1660,53 @@ mod tests {
             1
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[rstest]
+    #[case(LayoutType::FullyContiguous)]
+    #[case(LayoutType::LayerSeparate { outer_contiguous: true })]
+    #[case(LayoutType::LayerSeparate { outer_contiguous: false })]
+    async fn test_stage_disk_to_host(#[case] layout_type: LayoutType) -> Result<()> {
+        let (offload_manager, _, host_pool, disk_pool) = build_pools_with_layout(
+            4,
+            Some(4),
+            Some(4),
+            None,
+            layout_type,
+            BlockRegistrationDuplicationSetting::Disabled,
+            false,
+        )?;
+        let host_pool = host_pool.as_ref().unwrap();
+        let disk_pool = disk_pool.as_ref().unwrap();
+        let disk_block = completed_block(disk_pool, [0, 1, 2, 3]).await?;
+        let immutable_disk_block = disk_pool
+            .register_blocks(vec![disk_block])
+            .await?
+            .into_iter()
+            .next()
+            .unwrap();
+        populate_block(&immutable_disk_block, 42)?;
+        let targets = host_pool.allocate_blocks(1).await?;
+
+        let host_blocks = offload_manager
+            .stage_disk_to_host(vec![immutable_disk_block.clone()], Some(targets))
+            .await??;
+
+        assert_eq!(host_blocks.len(), 1);
+        assert_eq!(
+            host_blocks[0].sequence_hash(),
+            immutable_disk_block.sequence_hash()
+        );
+        check_block_contents(&immutable_disk_block, &host_blocks[0], 42)?;
+        assert_eq!(
+            host_pool
+                .match_sequence_hashes(&[immutable_disk_block.sequence_hash()])
+                .await?
+                .len(),
+            1
+        );
         Ok(())
     }
 

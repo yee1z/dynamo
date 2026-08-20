@@ -18,6 +18,7 @@ use super::{
 };
 
 pub const DYN_M2_DRY_RUN_NOTICE: &str = "DYN_M2_DRY_RUN_NOTICE";
+pub const DYN_M2_POLICY: &str = "DYN_M2_POLICY";
 pub const M2_NOTICE_EXTRA_ARGS_KEY: &str = "m2_speculative_onboarding_notice";
 pub const M2_NOTICE_SCHEMA: u16 = 1;
 
@@ -32,6 +33,23 @@ pub fn speculative_onboarding_dry_run_enabled() -> bool {
                     "1" | "true" | "yes" | "on"
                 )
             })
+    })
+}
+
+pub fn configured_speculative_onboarding_policy() -> Option<SpeculativeOnboardingPolicy> {
+    static POLICY: OnceLock<Option<SpeculativeOnboardingPolicy>> = OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var(DYN_M2_POLICY) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "passive" | "off" => None,
+            "dry_run" | "dry-run" => Some(SpeculativeOnboardingPolicy::DryRun),
+            "naive" => Some(SpeculativeOnboardingPolicy::Naive),
+            "window_aware" | "window-aware" => Some(SpeculativeOnboardingPolicy::WindowAware),
+            _ => None,
+        },
+        Err(_) if speculative_onboarding_dry_run_enabled() => {
+            Some(SpeculativeOnboardingPolicy::DryRun)
+        }
+        Err(_) => None,
     })
 }
 
@@ -58,6 +76,8 @@ impl From<&CacheIdentity> for SpeculativeCacheIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum SpeculativeOnboardingPolicy {
     DryRun,
+    Naive,
+    WindowAware,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +119,7 @@ pub enum SpeculativeOnboardingRejectReason {
     InvalidExtraArgs,
     ConflictingNotice,
     DispatchTargetMismatch,
+    InsufficientWindow,
 }
 
 impl SpeculativeOnboardingRejectReason {
@@ -118,6 +139,7 @@ impl SpeculativeOnboardingRejectReason {
             Self::InvalidExtraArgs => "invalid_extra_args",
             Self::ConflictingNotice => "conflicting_notice",
             Self::DispatchTargetMismatch => "dispatch_target_mismatch",
+            Self::InsufficientWindow => "insufficient_window",
         }
     }
 }
@@ -132,6 +154,7 @@ pub fn qualify_speculative_onboarding_notice(
     sequence_hashes: Option<&[SequenceHash]>,
     isl_tokens: usize,
     block_size: u32,
+    policy: SpeculativeOnboardingPolicy,
 ) -> Result<SpeculativeOnboardingNotice, SpeculativeOnboardingRejectReason> {
     let request_id = request_id.ok_or(SpeculativeOnboardingRejectReason::QueryOnly)?;
 
@@ -166,6 +189,10 @@ pub fn qualify_speculative_onboarding_notice(
             .as_millis(),
     )
     .unwrap_or(u64::MAX);
+    let freshness_ms = env_u64("DYN_M2_FRESHNESS_MS", 600_000);
+    if state_age_ms > freshness_ms {
+        return Err(SpeculativeOnboardingRejectReason::StateStale);
+    }
 
     if tiers.dp_device_blocks.as_slice() != [(worker.dp_rank, tiers.gpu_blocks)].as_slice() {
         return Err(SpeculativeOnboardingRejectReason::UnsupportedDpTopology);
@@ -188,15 +215,37 @@ pub fn qualify_speculative_onboarding_notice(
 
     let sequence_hashes =
         sequence_hashes.ok_or(SpeculativeOnboardingRejectReason::MissingBlockHashes)?;
-    let disk_hashes = sequence_hashes
+    let mut disk_hashes = sequence_hashes
         .get(host_blocks..disk_blocks)
         .ok_or(SpeculativeOnboardingRejectReason::BlockHashBounds)?
         .to_vec();
+    let max_blocks =
+        usize::try_from(env_u64("DYN_M2_MAX_BLOCKS", u32::MAX as u64)).unwrap_or(usize::MAX);
+    disk_hashes.truncate(max_blocks);
     let predicted_disk_blocks = u32::try_from(disk_hashes.len())
         .map_err(|_| SpeculativeOnboardingRejectReason::BlockHashBounds)?;
     if predicted_disk_blocks == 0 {
         return Err(SpeculativeOnboardingRejectReason::NoDiskBlocks);
     }
+
+    let bytes = u64::from(predicted_disk_blocks).saturating_mul(2_359_296);
+    let bandwidth_mib_s = env_u64("DYN_M2_STAGE_BANDWIDTH_MIB_S", 1_500).max(1);
+    let estimated_stage_ms = bytes
+        .saturating_mul(1_000)
+        .div_ceil(bandwidth_mib_s.saturating_mul(1024 * 1024));
+    let predicted_queue_window_ms = env_u64("DYN_M2_QUEUE_WINDOW_MS", 0);
+    let control_overhead_ms = env_u64("DYN_M2_CONTROL_OVERHEAD_MS", 10);
+    let safety_permille = env_u64("DYN_M2_SAFETY_PERMILLE", 1_250);
+    let required_window_ms = estimated_stage_ms
+        .saturating_mul(safety_permille)
+        .div_ceil(1_000)
+        .saturating_add(control_overhead_ms);
+    if policy == SpeculativeOnboardingPolicy::WindowAware
+        && predicted_queue_window_ms < required_window_ms
+    {
+        return Err(SpeculativeOnboardingRejectReason::InsufficientWindow);
+    }
+    let deadline_budget_ms = env_u64("DYN_M2_DEADLINE_MS", predicted_queue_window_ms.max(1));
 
     Ok(SpeculativeOnboardingNotice {
         schema: M2_NOTICE_SCHEMA,
@@ -211,11 +260,18 @@ pub fn qualify_speculative_onboarding_notice(
             .map_err(|_| SpeculativeOnboardingRejectReason::BlockHashBounds)?,
         block_hashes: disk_hashes,
         predicted_disk_blocks,
-        predicted_queue_window_ms: None,
-        estimated_stage_ms: None,
-        deadline_budget_ms: None,
-        policy: SpeculativeOnboardingPolicy::DryRun,
+        predicted_queue_window_ms: Some(predicted_queue_window_ms),
+        estimated_stage_ms: Some(estimated_stage_ms),
+        deadline_budget_ms: Some(deadline_budget_ms),
+        policy,
     })
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -259,6 +315,27 @@ mod tests {
             hashes,
             isl_tokens,
             4,
+            SpeculativeOnboardingPolicy::DryRun,
+        )
+    }
+
+    fn qualify_policy(
+        state: &LowerTierStateView,
+        tiers: &SelectedWorkerTierSnapshot,
+        hashes: Option<&[SequenceHash]>,
+        isl_tokens: usize,
+        policy: SpeculativeOnboardingPolicy,
+    ) -> Result<SpeculativeOnboardingNotice, SpeculativeOnboardingRejectReason> {
+        qualify_speculative_onboarding_notice(
+            Some("request-1"),
+            WorkerWithDpRank::new(9, 0),
+            &CacheIdentity::new("model", "", None::<String>),
+            state,
+            tiers,
+            hashes,
+            isl_tokens,
+            4,
+            policy,
         )
     }
 
@@ -308,6 +385,40 @@ mod tests {
                 Err(expected)
             );
         }
+    }
+
+    #[test]
+    fn known_but_over_threshold_state_fails_closed() {
+        let mut state = known_state();
+        state.age = Some(Duration::from_millis(600_001));
+        assert_eq!(
+            qualify(&state, &tiers(0, 0, 1), Some(&[10]), 8),
+            Err(SpeculativeOnboardingRejectReason::StateStale)
+        );
+    }
+
+    #[test]
+    fn window_aware_requires_the_frozen_queue_window() {
+        assert_eq!(
+            qualify_policy(
+                &known_state(),
+                &tiers(0, 0, 1),
+                Some(&[10]),
+                8,
+                SpeculativeOnboardingPolicy::WindowAware,
+            ),
+            Err(SpeculativeOnboardingRejectReason::InsufficientWindow)
+        );
+        assert!(
+            qualify_policy(
+                &known_state(),
+                &tiers(0, 0, 1),
+                Some(&[10]),
+                8,
+                SpeculativeOnboardingPolicy::Naive,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

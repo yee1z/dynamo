@@ -21,9 +21,8 @@ use dynamo_kv_router::{
     scheduling::{
         CacheHitEstimates, CacheIdentity, LowerTierStateLedger, OverlapAnalysis,
         OverloadedWorkerProvider, ScheduleMode, ScheduleRequest, SpeculativeOnboardingNotice,
-        TieredOverlapRefresher, effective_prefill_tokens,
+        TieredOverlapRefresher, configured_speculative_onboarding_policy, effective_prefill_tokens,
         overlap::cache_hit_estimates_from_tiered_matches, qualify_speculative_onboarding_notice,
-        speculative_onboarding_dry_run_enabled,
     },
 };
 use dynamo_runtime::{
@@ -575,8 +574,8 @@ where
                 request_id: context_id.map(str::to_string),
             }
         };
-        let m2_dry_run = speculative_onboarding_dry_run_enabled();
-        let m2_request_id = if m2_dry_run {
+        let m2_policy = configured_speculative_onboarding_policy();
+        let m2_request_id = if m2_policy.is_some() {
             mode.tracked_request_id().map(str::to_string)
         } else {
             None
@@ -710,7 +709,7 @@ where
         };
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);
-        let speculative_onboarding_notice = if m2_dry_run {
+        let speculative_onboarding_notice = if let Some(m2_policy) = m2_policy {
             match qualify_speculative_onboarding_notice(
                 m2_request_id.as_deref(),
                 response.best_worker,
@@ -720,6 +719,7 @@ where
                 m2_sequence_hashes.as_deref(),
                 isl_tokens,
                 self.block_size,
+                m2_policy,
             ) {
                 Ok(notice) => {
                     tracing::info!(
@@ -735,10 +735,16 @@ where
                             "state_version": notice.state_version,
                             "worker_epoch": notice.worker_epoch,
                             "state_age_ms": notice.state_age_ms,
+                            "state_status": "known",
                             "predicted_disk_blocks": notice.predicted_disk_blocks,
+                            "bytes": u64::from(notice.predicted_disk_blocks)
+                                .saturating_mul(dynamo_runtime::nvtx::PHASE_C_BLOCK_BYTES),
                             "block_hashes": &notice.block_hashes,
+                            "predicted_queue_window_ms": notice.predicted_queue_window_ms,
+                            "estimated_stage_ms": notice.estimated_stage_ms,
+                            "deadline_budget_ms": notice.deadline_budget_ms,
                             "policy": notice.policy,
-                            "disposition": "dry_run_candidate",
+                            "disposition": "candidate",
                         })
                     );
                     Some(Box::new(notice))

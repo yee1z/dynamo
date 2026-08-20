@@ -51,6 +51,9 @@ _M2_CONTROL_ENDPOINT = "m2_speculative_onboarding"
 
 
 def _m2_dry_run_enabled() -> bool:
+    policy = os.getenv("DYN_M2_POLICY", "").lower()
+    if policy in {"dry_run", "dry-run", "naive", "window_aware", "window-aware"}:
+        return True
     return os.getenv("DYN_M2_DRY_RUN_NOTICE", "").lower() in {
         "1",
         "true",

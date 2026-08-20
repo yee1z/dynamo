@@ -392,7 +392,7 @@ impl KvPushRouter {
                         "event": "notice_dispatched",
                         "worker_id": notice.worker_id,
                         "dp_rank": notice.dp_rank,
-                        "disposition": "dry_run",
+                        "disposition": notice.policy,
                     })
                 ),
                 Err(reason) => tracing::warn!(

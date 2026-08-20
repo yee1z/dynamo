@@ -95,6 +95,15 @@ impl<Locality: LocalityProvider, Metadata: BlockMetadata> KvBlockManagerState<Lo
     ) -> oneshot::Receiver<BlockResult<DeviceStorage, Locality, Metadata>> {
         self.offload_manager.onboard(blocks, targets)
     }
+
+    /// Stage registered disk blocks into this manager's pinned-host pool.
+    pub fn stage_disk_blocks(
+        &self,
+        blocks: Vec<ImmutableBlock<DiskStorage, Locality, Metadata>>,
+        targets: Option<Vec<MutableBlock<PinnedStorage, Locality, Metadata>>>,
+    ) -> oneshot::Receiver<BlockResult<PinnedStorage, Locality, Metadata>> {
+        self.offload_manager.stage_disk_to_host(blocks, targets)
+    }
 }
 
 impl<R: LogicalResources, Metadata: BlockMetadata>

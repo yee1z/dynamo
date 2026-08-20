@@ -6,7 +6,9 @@ pub mod slot;
 
 use super::*;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
-use dynamo_llm::kv_router::scheduling::{M2_NOTICE_SCHEMA, SpeculativeOnboardingNotice};
+use dynamo_llm::kv_router::scheduling::{
+    M2_NOTICE_SCHEMA, SpeculativeOnboardingNotice, SpeculativeOnboardingPolicy,
+};
 use slot::{ConnectorSlotManager, SlotError, SlotManager, SlotState};
 
 use crate::block_manager::BlockManagerBuilder;
@@ -30,6 +32,7 @@ use dynamo_runtime::config::environment_names::kvbm as env_kvbm;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
@@ -107,6 +110,10 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
     fn reset_cache(&mut self) -> anyhow::Result<bool>;
 
     fn slot_manager(&self) -> &ConnectorSlotManager<String>;
+
+    fn m2_staging_manager(&self) -> Option<Arc<M2StagingManager>> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +124,7 @@ pub struct KvConnectorLeader {
     onboarding_slots: HashSet<String>,
     iteration_counter: u64,
     kvbm_metrics: KvbmMetrics,
+    m2_staging: Arc<OnceLock<Arc<M2StagingManager>>>,
 }
 
 impl KvConnectorLeader {
@@ -144,14 +152,17 @@ impl KvConnectorLeader {
         let kvbm_metrics_clone = kvbm_metrics.clone();
 
         let slot_manager_cell = Arc::new(OnceLock::new());
+        let m2_staging_cell = Arc::new(OnceLock::new());
         let (leader_ready_tx, leader_ready_rx) = oneshot::channel::<String>();
 
         {
             let slot_manager_cell = slot_manager_cell.clone();
+            let m2_staging_cell = m2_staging_cell.clone();
             // Capture consolidator endpoints for the async block
             let consolidator_vllm_ep = consolidator_vllm_endpoint.clone();
             let consolidator_output_ep = consolidator_output_endpoint.clone();
             let consolidator_mode = parse_consolidator_mode(consolidator_mode.clone());
+            let staging_handle = handle.clone();
 
             handle.spawn(async move {
                 let ready = leader.wait_worker_sync_ready().await;
@@ -202,6 +213,14 @@ impl KvConnectorLeader {
                     Some(format!("worker-{}", worker_id)), // identifier for cache stats
                 );
 
+                if m2_side_effect_enabled() {
+                    let _ = m2_staging_cell.set(Arc::new(M2StagingManager::new(
+                        block_manager.get_block_manager().clone(),
+                        staging_handle,
+                        m2_side_effect_policy().expect("side-effect policy was checked"),
+                    )));
+                }
+
                 let _ = slot_manager_cell.set(sm);
 
                 if leader_ready_tx.send("finished".to_string()).is_err() {
@@ -226,6 +245,7 @@ impl KvConnectorLeader {
             onboarding_slots: HashSet::new(),
             iteration_counter: 0,
             kvbm_metrics,
+            m2_staging: m2_staging_cell,
         }
     }
 }
@@ -236,6 +256,10 @@ impl Leader for KvConnectorLeader {
         self.slot_manager
             .get()
             .expect("slot_manager not initialized")
+    }
+
+    fn m2_staging_manager(&self) -> Option<Arc<M2StagingManager>> {
+        self.m2_staging.get().cloned()
     }
 
     /// Match the tokens in the request with the available block pools.
@@ -725,14 +749,53 @@ const DYN_M2_DRY_RUN_NOTICE: &str = "DYN_M2_DRY_RUN_NOTICE";
 const M2_CONTROL_MAX_BYTES: u64 = 1024 * 1024;
 
 fn m2_dry_run_enabled() -> bool {
-    std::env::var(DYN_M2_DRY_RUN_NOTICE)
+    let legacy = std::env::var(DYN_M2_DRY_RUN_NOTICE)
         .ok()
         .is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             )
+        });
+    legacy
+        || std::env::var("DYN_M2_POLICY").ok().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "dry_run" | "dry-run" | "naive" | "window_aware" | "window-aware"
+            )
         })
+}
+
+fn m2_side_effect_enabled() -> bool {
+    m2_side_effect_policy().is_some()
+}
+
+fn m2_side_effect_policy() -> Option<SpeculativeOnboardingPolicy> {
+    match std::env::var("DYN_M2_POLICY")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "naive" => Some(SpeculativeOnboardingPolicy::Naive),
+        "window_aware" | "window-aware" => Some(SpeculativeOnboardingPolicy::WindowAware),
+        _ => None,
+    }
+}
+
+fn m2_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn m2_failure_injection() -> Option<String> {
+    let qualification = std::env::var("DYN_M2_QUALIFICATION")
+        .ok()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
+    qualification
+        .then(|| std::env::var("DYN_M2_FAILURE_INJECTION").ok())
+        .flatten()
 }
 
 fn m2_control_socket_path(worker_id: u64, dp_rank: u32) -> PathBuf {
@@ -762,10 +825,467 @@ struct M2ControlTarget {
     connector_engine_id: String,
 }
 
+type M2HostBlocks = Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>;
+
+enum M2StageState {
+    InFlight,
+    Ready(M2HostBlocks),
+    Demanding(M2HostBlocks),
+    Reused,
+    Cancelled,
+    Expired,
+    Failed,
+    Rejected,
+}
+
+struct M2StageEntry {
+    state: M2StageState,
+    notice: SpeculativeOnboardingNotice,
+    worker_epoch: u64,
+    state_version: u64,
+    blocks: usize,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct M2StageRegistry {
+    entries: HashMap<String, M2StageEntry>,
+    reserved_blocks: usize,
+    in_flight_request: Option<String>,
+    worker_epoch: Option<u64>,
+    latest_state_version: Option<u64>,
+}
+
+pub struct M2StagingManager {
+    block_manager: VllmBlockManager,
+    runtime: Handle,
+    policy: SpeculativeOnboardingPolicy,
+    registry: Mutex<M2StageRegistry>,
+}
+
+impl std::fmt::Debug for M2StagingManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("M2StagingManager").finish_non_exhaustive()
+    }
+}
+
+impl M2StagingManager {
+    fn new(
+        block_manager: VllmBlockManager,
+        runtime: Handle,
+        policy: SpeculativeOnboardingPolicy,
+    ) -> Self {
+        Self {
+            block_manager,
+            runtime,
+            policy,
+            registry: Mutex::new(M2StageRegistry::default()),
+        }
+    }
+
+    fn trace(
+        notice: &SpeculativeOnboardingNotice,
+        event: &str,
+        result: &str,
+        reason: Option<&str>,
+    ) {
+        tracing::info!(
+            "DYN_M2_TRACE {}",
+            serde_json::json!({
+                "schema": 1,
+                "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                "request_id": notice.request_id,
+                "request_key": dynamo_runtime::nvtx::request_key(&notice.request_id),
+                "component": "staging_manager",
+                "event": event,
+                "worker_id": notice.worker_id,
+                "dp_rank": notice.dp_rank,
+                "policy": notice.policy,
+                "state_version": notice.state_version,
+                "worker_epoch": notice.worker_epoch,
+                "state_age_ms": notice.state_age_ms,
+                "predicted_blocks": notice.predicted_disk_blocks,
+                "bytes": u64::from(notice.predicted_disk_blocks)
+                    .saturating_mul(dynamo_runtime::nvtx::PHASE_C_BLOCK_BYTES),
+                "deadline_budget_ms": notice.deadline_budget_ms,
+                "result": result,
+                "reason": reason,
+            })
+        );
+    }
+
+    fn reject(&self, notice: &SpeculativeOnboardingNotice, reason: &'static str) -> &'static str {
+        Self::trace(notice, "stage_reject", "rejected", Some(reason));
+        Self::trace(notice, "fallback", "passive", Some(reason));
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.entries.insert(
+                notice.request_id.clone(),
+                M2StageEntry {
+                    state: M2StageState::Rejected,
+                    notice: notice.clone(),
+                    worker_epoch: notice.worker_epoch,
+                    state_version: notice.state_version,
+                    blocks: 0,
+                    deadline: Instant::now(),
+                },
+            );
+        }
+        "rejected"
+    }
+
+    fn admit(self: &Arc<Self>, notice: SpeculativeOnboardingNotice) -> &'static str {
+        if notice.policy != self.policy {
+            return self.reject(&notice, "policy_mismatch");
+        }
+        if notice.state_age_ms > m2_env_u64("DYN_M2_FRESHNESS_MS", 600_000) {
+            return self.reject(&notice, "state_stale");
+        }
+        match m2_failure_injection().as_deref() {
+            Some("identity") => return self.reject(&notice, "identity_injection"),
+            Some("g2_full") => return self.reject(&notice, "g2_full_injection"),
+            _ => {}
+        }
+
+        let block_count = notice.block_hashes.len();
+        let deadline =
+            Instant::now() + Duration::from_millis(notice.deadline_budget_ms.unwrap_or(1).max(1));
+        let Some(host_pool) = self.block_manager.host() else {
+            return self.reject(&notice, "g2_unavailable");
+        };
+        let Some(disk_pool) = self.block_manager.disk() else {
+            return self.reject(&notice, "g3_unavailable");
+        };
+        let capacity_limit = usize::try_from(host_pool.total_blocks() / 4).unwrap_or(usize::MAX);
+        if block_count == 0
+            || block_count > capacity_limit
+            || u64::try_from(block_count).unwrap_or(u64::MAX) > host_pool.available_blocks()
+        {
+            return self.reject(&notice, "g2_capacity");
+        }
+
+        {
+            let Ok(mut registry) = self.registry.lock() else {
+                return "rejected";
+            };
+            if let Some(existing) = registry.entries.get(&notice.request_id) {
+                if existing.worker_epoch == notice.worker_epoch
+                    && existing.state_version == notice.state_version
+                {
+                    return "duplicate";
+                }
+                return "rejected";
+            }
+            if registry
+                .worker_epoch
+                .is_some_and(|epoch| epoch != notice.worker_epoch)
+            {
+                drop(registry);
+                return self.reject(&notice, "worker_epoch_mismatch");
+            }
+            if registry
+                .latest_state_version
+                .is_some_and(|version| notice.state_version < version)
+            {
+                drop(registry);
+                return self.reject(&notice, "state_version_regression");
+            }
+            if registry.in_flight_request.is_some() {
+                drop(registry);
+                return self.reject(&notice, "in_flight_limit");
+            }
+            registry.worker_epoch = Some(notice.worker_epoch);
+            registry.latest_state_version = Some(notice.state_version);
+            registry.reserved_blocks = registry.reserved_blocks.saturating_add(block_count);
+            registry.in_flight_request = Some(notice.request_id.clone());
+            registry.entries.insert(
+                notice.request_id.clone(),
+                M2StageEntry {
+                    state: M2StageState::InFlight,
+                    notice: notice.clone(),
+                    worker_epoch: notice.worker_epoch,
+                    state_version: notice.state_version,
+                    blocks: block_count,
+                    deadline,
+                },
+            );
+        }
+
+        let disk_blocks = match disk_pool.match_sequence_hashes_blocking(&notice.block_hashes) {
+            Ok(blocks) if blocks.len() == block_count => blocks,
+            _ => return self.fail_admission(&notice, block_count, "disk_match_mismatch"),
+        };
+        let targets = match host_pool.allocate_blocks_blocking(block_count) {
+            Ok(blocks) => blocks,
+            Err(_) => return self.fail_admission(&notice, block_count, "g2_reservation_failed"),
+        };
+        let still_active = self.registry.lock().is_ok_and(|registry| {
+            registry.in_flight_request.as_deref() == Some(&notice.request_id)
+                && registry
+                    .entries
+                    .get(&notice.request_id)
+                    .is_some_and(|entry| matches!(entry.state, M2StageState::InFlight))
+        });
+        if !still_active {
+            drop(targets);
+            return self.fail_admission(&notice, block_count, "cancelled_before_submit");
+        }
+
+        Self::trace(&notice, "stage_reserve", "reserved", None);
+        let receiver = self
+            .block_manager
+            .stage_disk_blocks(disk_blocks, Some(targets));
+        Self::trace(&notice, "stage_submit", "submitted", None);
+        Self::trace(&notice, "stage_transfer_start", "in_flight", None);
+
+        let manager = self.clone();
+        let transfer_notice = notice.clone();
+        self.runtime.spawn(async move {
+            if m2_failure_injection().as_deref() == Some("cancel") {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let result = receiver.await;
+            let inject_transfer_failure =
+                m2_failure_injection().as_deref() == Some("transfer_failure");
+            let mut release_reason = Some("orphaned_after_reset");
+            if let Ok(mut registry) = manager.registry.lock() {
+                if registry.in_flight_request.as_deref() == Some(&transfer_notice.request_id) {
+                    registry.in_flight_request = None;
+                }
+                let mut released = block_count;
+                if let Some(entry) = registry.entries.get_mut(&transfer_notice.request_id) {
+                    match (&entry.state, result) {
+                        (M2StageState::InFlight, Ok(Ok(blocks)))
+                            if !inject_transfer_failure && Instant::now() <= entry.deadline =>
+                        {
+                            entry.state = M2StageState::Ready(blocks);
+                            released = 0;
+                            release_reason = None;
+                        }
+                        (M2StageState::InFlight, Ok(Ok(_))) if inject_transfer_failure => {
+                            entry.state = M2StageState::Failed;
+                            released = entry.blocks;
+                            release_reason = Some("transfer_failure_injection");
+                        }
+                        (M2StageState::InFlight, Ok(Ok(_))) => {
+                            entry.state = M2StageState::Expired;
+                            released = entry.blocks;
+                            release_reason = Some("deadline");
+                        }
+                        (M2StageState::InFlight, _) => {
+                            entry.state = M2StageState::Failed;
+                            released = entry.blocks;
+                            release_reason = Some("transfer_failure");
+                        }
+                        (_, Ok(Ok(_))) => {
+                            released = entry.blocks;
+                            release_reason = Some("cancelled_or_expired");
+                        }
+                        (_, _) => {
+                            released = entry.blocks;
+                            release_reason = Some("drained_failure");
+                        }
+                    }
+                }
+                registry.reserved_blocks = registry.reserved_blocks.saturating_sub(released);
+            }
+            Self::trace(
+                &transfer_notice,
+                "stage_transfer_end",
+                if release_reason.is_none() {
+                    "ok"
+                } else {
+                    "released"
+                },
+                release_reason,
+            );
+            if release_reason == Some("deadline") {
+                Self::trace(&transfer_notice, "timeout", "expired", Some("deadline"));
+            }
+            if release_reason.is_none() {
+                Self::trace(&transfer_notice, "staged_ready", "ready", None);
+            } else {
+                Self::trace(&transfer_notice, "fallback", "passive", release_reason);
+                Self::trace(&transfer_notice, "release", "released", release_reason);
+            }
+        });
+
+        if m2_failure_injection().as_deref() == Some("reset") {
+            let manager = self.clone();
+            self.runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                manager.reset();
+            });
+        }
+
+        let manager = self.clone();
+        let deadline_notice = notice;
+        self.runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            let mut released = 0;
+            if let Ok(mut registry) = manager.registry.lock()
+                && let Some(entry) = registry.entries.get_mut(&deadline_notice.request_id)
+                && matches!(entry.state, M2StageState::Ready(_))
+            {
+                entry.state = M2StageState::Expired;
+                released = entry.blocks;
+                registry.reserved_blocks = registry.reserved_blocks.saturating_sub(released);
+            }
+            if released > 0 {
+                Self::trace(&deadline_notice, "timeout", "expired", Some("deadline"));
+                Self::trace(&deadline_notice, "fallback", "passive", Some("deadline"));
+                Self::trace(&deadline_notice, "release", "released", Some("deadline"));
+            }
+        });
+        "submitted"
+    }
+
+    fn fail_admission(
+        &self,
+        notice: &SpeculativeOnboardingNotice,
+        block_count: usize,
+        reason: &'static str,
+    ) -> &'static str {
+        if let Ok(mut registry) = self.registry.lock() {
+            if registry.in_flight_request.as_deref() == Some(&notice.request_id) {
+                registry.in_flight_request = None;
+            }
+            registry.reserved_blocks = registry.reserved_blocks.saturating_sub(block_count);
+            if let Some(entry) = registry.entries.get_mut(&notice.request_id) {
+                entry.state = M2StageState::Rejected;
+            }
+        }
+        Self::trace(notice, "stage_reject", "rejected", Some(reason));
+        Self::trace(notice, "fallback", "passive", Some(reason));
+        "rejected"
+    }
+
+    fn demand(&self, request_id: &str) -> bool {
+        let mut traces = Vec::new();
+        let ready = if let Ok(mut registry) = self.registry.lock() {
+            match registry.entries.get_mut(request_id) {
+                Some(entry) => match &mut entry.state {
+                    M2StageState::Ready(blocks) => {
+                        let held = std::mem::take(blocks);
+                        entry.state = M2StageState::Demanding(held);
+                        true
+                    }
+                    M2StageState::InFlight => {
+                        entry.state = M2StageState::Cancelled;
+                        traces.push((
+                            entry.notice.clone(),
+                            "cancel",
+                            "cancelled",
+                            Some("demand_before_ready"),
+                        ));
+                        traces.push((
+                            entry.notice.clone(),
+                            "fallback",
+                            "passive",
+                            Some("demand_before_ready"),
+                        ));
+                        false
+                    }
+                    _ => false,
+                },
+                None => false,
+            }
+        } else {
+            false
+        };
+        for (notice, event, result, reason) in traces {
+            Self::trace(&notice, event, result, reason);
+        }
+        ready
+    }
+
+    fn complete_demand(&self, request_id: &str, matched: bool) {
+        let mut trace = None;
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(entry) = registry.entries.get_mut(request_id)
+            && matches!(entry.state, M2StageState::Demanding(_))
+        {
+            entry.state = if matched {
+                M2StageState::Reused
+            } else {
+                M2StageState::Cancelled
+            };
+            let blocks = entry.blocks;
+            trace = Some((entry.notice.clone(), matched));
+            registry.reserved_blocks = registry.reserved_blocks.saturating_sub(blocks);
+        }
+        if let Some((notice, matched)) = trace {
+            if matched {
+                Self::trace(&notice, "demand_reuse", "reused", None);
+            } else {
+                Self::trace(&notice, "fallback", "passive", Some("staged_match_miss"));
+                Self::trace(&notice, "release", "released", Some("staged_match_miss"));
+            }
+        }
+    }
+
+    fn cancel(&self, request_id: &str, reason: &'static str) {
+        let mut trace = None;
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(entry) = registry.entries.get_mut(request_id)
+        {
+            let released = match &mut entry.state {
+                M2StageState::Ready(blocks) | M2StageState::Demanding(blocks) => {
+                    blocks.clear();
+                    entry.blocks
+                }
+                M2StageState::InFlight => 0,
+                _ => return,
+            };
+            entry.state = M2StageState::Cancelled;
+            trace = Some((entry.notice.clone(), released > 0));
+            registry.reserved_blocks = registry.reserved_blocks.saturating_sub(released);
+        }
+        if let Some((notice, released)) = trace {
+            Self::trace(&notice, "cancel", "cancelled", Some(reason));
+            if released {
+                Self::trace(&notice, "release", "released", Some(reason));
+            }
+        }
+    }
+
+    fn reset(&self) {
+        let mut released = Vec::new();
+        if let Ok(mut registry) = self.registry.lock() {
+            let in_flight_blocks = registry
+                .in_flight_request
+                .as_ref()
+                .and_then(|request_id| registry.entries.get(request_id))
+                .map_or(0, |entry| entry.blocks);
+            released.extend(
+                registry
+                    .entries
+                    .values()
+                    .filter(|entry| {
+                        matches!(
+                            entry.state,
+                            M2StageState::Ready(_) | M2StageState::Demanding(_)
+                        )
+                    })
+                    .map(|entry| entry.notice.clone()),
+            );
+            registry.entries.clear();
+            registry.reserved_blocks = in_flight_blocks;
+            registry.worker_epoch = None;
+            registry.latest_state_version = None;
+        }
+        for notice in released {
+            Self::trace(&notice, "cancel", "cancelled", Some("reset"));
+            Self::trace(&notice, "fallback", "passive", Some("reset"));
+            Self::trace(&notice, "release", "released", Some("reset"));
+        }
+    }
+}
+
 fn observe_m2_control_notice(
     notice_json: &str,
     target: &M2ControlTarget,
     notices: &Mutex<HashMap<String, SpeculativeOnboardingNotice>>,
+    staging: Option<&Arc<M2StagingManager>>,
 ) -> String {
     let notice = match serde_json::from_str::<SpeculativeOnboardingNotice>(notice_json) {
         Ok(notice) => notice,
@@ -809,19 +1329,31 @@ fn observe_m2_control_notice(
     if notice.identity.model != target.model {
         return reject("identity_mismatch");
     }
+    if !notice.identity.salt.is_empty() || notice.identity.adapter.is_some() {
+        return reject("unsupported_identity");
+    }
     if notice.predicted_disk_blocks == 0
         || usize::try_from(notice.predicted_disk_blocks).ok() != Some(notice.block_hashes.len())
     {
         return reject("block_hash_bounds");
     }
 
-    let disposition = match notices.lock() {
+    let registry_disposition = match notices.lock() {
         Ok(mut notices) => match record_speculative_onboarding_notice(&mut notices, notice.clone())
         {
             Ok(disposition) => disposition,
             Err(reason) => return reject(reason),
         },
         Err(_) => return reject("registry_poisoned"),
+    };
+    let (disposition, admission_reason) = if registry_disposition == "accepted" {
+        match (notice.policy, staging) {
+            (SpeculativeOnboardingPolicy::DryRun, _) => (registry_disposition, None),
+            (_, Some(manager)) => (manager.admit(notice.clone()), None),
+            (_, None) => ("rejected", Some("staging_unavailable")),
+        }
+    } else {
+        (registry_disposition, None)
     };
     tracing::info!(
         "DYN_M2_TRACE {}",
@@ -849,7 +1381,7 @@ fn observe_m2_control_notice(
         request_id: &notice.request_id,
         worker_id: target.worker_id,
         dp_rank: target.dp_rank,
-        reason: None,
+        reason: admission_reason,
     })
     .expect("M2 control acknowledgement is serializable")
 }
@@ -865,15 +1397,17 @@ impl M2ControlServer {
         handle: &Handle,
         target: M2ControlTarget,
         notices: Arc<Mutex<HashMap<String, SpeculativeOnboardingNotice>>>,
+        staging: Option<Arc<M2StagingManager>>,
     ) -> anyhow::Result<Self> {
         let socket_path = m2_control_socket_path(target.worker_id, target.dp_rank);
-        Self::start_at(handle, target, notices, socket_path)
+        Self::start_at(handle, target, notices, staging, socket_path)
     }
 
     fn start_at(
         handle: &Handle,
         target: M2ControlTarget,
         notices: Arc<Mutex<HashMap<String, SpeculativeOnboardingNotice>>>,
+        staging: Option<Arc<M2StagingManager>>,
         socket_path: PathBuf,
     ) -> anyhow::Result<Self> {
         if Path::new(&socket_path).exists() {
@@ -906,6 +1440,7 @@ impl M2ControlServer {
                 };
                 let target = target.clone();
                 let notices = notices.clone();
+                let staging = staging.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader).take(M2_CONTROL_MAX_BYTES + 1);
@@ -919,9 +1454,12 @@ impl M2ControlServer {
                         {
                             request.pop();
                             match std::str::from_utf8(&request) {
-                                Ok(request) => {
-                                    observe_m2_control_notice(request, &target, &notices)
-                                }
+                                Ok(request) => observe_m2_control_notice(
+                                    request,
+                                    &target,
+                                    &notices,
+                                    staging.as_ref(),
+                                ),
                                 Err(_) => serde_json::json!({
                                     "schema": M2_NOTICE_SCHEMA,
                                     "status": "ok",
@@ -965,6 +1503,7 @@ impl Drop for M2ControlServer {
 pub struct PyKvConnectorLeader {
     connector_leader: Box<dyn Leader>,
     m2_dry_run_notices: Arc<Mutex<HashMap<String, SpeculativeOnboardingNotice>>>,
+    m2_staging_manager: Option<Arc<M2StagingManager>>,
     _m2_control_server: Option<M2ControlServer>,
 }
 
@@ -1014,6 +1553,7 @@ impl PyKvConnectorLeader {
                 consolidator_mode,
             ))
         };
+        let m2_staging_manager = connector_leader.m2_staging_manager();
         let m2_dry_run_notices = Arc::new(Mutex::new(HashMap::new()));
         let m2_control_server = if m2_dry_run_enabled() {
             match (m2_worker_id, m2_dp_rank, m2_model) {
@@ -1026,6 +1566,7 @@ impl PyKvConnectorLeader {
                         connector_engine_id,
                     },
                     m2_dry_run_notices.clone(),
+                    m2_staging_manager.clone(),
                 )
                 .map(Some)
                 .unwrap_or_else(|error| {
@@ -1043,6 +1584,7 @@ impl PyKvConnectorLeader {
         Ok(Self {
             connector_leader,
             m2_dry_run_notices,
+            m2_staging_manager,
             _m2_control_server: m2_control_server,
         })
     }
@@ -1136,11 +1678,12 @@ impl PyKvConnectorLeader {
         request_num_tokens: usize,
         num_computed_tokens: usize,
     ) -> PyResult<(usize, bool)> {
-        if let Some(canonical_request_id) = dynamo_runtime::nvtx::canonical_uuid(&request_id)
+        let canonical_request_id = dynamo_runtime::nvtx::canonical_uuid(&request_id);
+        let staged_ready = if let Some(canonical_request_id) = canonical_request_id.as_deref()
             && self
                 .m2_dry_run_notices
                 .lock()
-                .is_ok_and(|notices| notices.contains_key(&canonical_request_id))
+                .is_ok_and(|notices| notices.contains_key(canonical_request_id))
         {
             tracing::info!(
                 "DYN_M2_TRACE {}",
@@ -1153,10 +1696,29 @@ impl PyKvConnectorLeader {
                     "event": "connector_match_start",
                 })
             );
+            self.m2_staging_manager
+                .as_ref()
+                .is_some_and(|manager| manager.demand(canonical_request_id))
+        } else {
+            false
+        };
+        let result = self.connector_leader.get_num_new_matched_tokens(
+            request_id,
+            request_num_tokens,
+            num_computed_tokens,
+        );
+        if staged_ready
+            && let (Some(manager), Some(canonical_request_id)) = (
+                self.m2_staging_manager.as_ref(),
+                canonical_request_id.as_deref(),
+            )
+        {
+            let matched = result
+                .as_ref()
+                .is_ok_and(|(tokens, has_match)| *has_match && *tokens > 0);
+            manager.complete_demand(canonical_request_id, matched);
         }
-        self.connector_leader
-            .get_num_new_matched_tokens(request_id, request_num_tokens, num_computed_tokens)
-            .map_err(to_pyerr)
+        result.map_err(to_pyerr)
     }
 
     fn update_state_after_alloc(
@@ -1182,7 +1744,14 @@ impl PyKvConnectorLeader {
             .request_finished(request_id.to_string(), block_ids)
             .map_err(to_pyerr);
         if let Ok(mut notices) = self.m2_dry_run_notices.lock() {
-            notices.remove(request_id);
+            let canonical = dynamo_runtime::nvtx::canonical_uuid(request_id)
+                .unwrap_or_else(|| request_id.to_string());
+            notices.remove(&canonical);
+        }
+        if let Some(manager) = self.m2_staging_manager.as_ref() {
+            let canonical = dynamo_runtime::nvtx::canonical_uuid(request_id)
+                .unwrap_or_else(|| request_id.to_string());
+            manager.cancel(&canonical, "request_finished");
         }
         result
     }
@@ -1203,6 +1772,9 @@ impl PyKvConnectorLeader {
             .map_err(to_pyerr)?;
         if reset && let Ok(mut notices) = self.m2_dry_run_notices.lock() {
             notices.clear();
+        }
+        if reset && let Some(manager) = self.m2_staging_manager.as_ref() {
+            manager.reset();
         }
         Ok(reset)
     }
@@ -1351,6 +1923,47 @@ mod m2_notice_tests {
         assert_eq!(notices.len(), 1);
     }
 
+    #[test]
+    fn side_effect_notice_without_staging_manager_fails_closed() {
+        let mut side_effect = notice(REQUEST_ID);
+        side_effect.policy = SpeculativeOnboardingPolicy::Naive;
+        let notices = Mutex::new(HashMap::new());
+        let response = observe_m2_control_notice(
+            &serde_json::to_string(&side_effect).unwrap(),
+            &M2ControlTarget {
+                worker_id: 7,
+                dp_rank: 0,
+                model: "model".to_string(),
+                connector_engine_id: "engine".to_string(),
+            },
+            &notices,
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["disposition"], "rejected");
+    }
+
+    #[test]
+    fn unsupported_cache_identity_fails_closed_at_control_endpoint() {
+        let mut unsupported = notice(REQUEST_ID);
+        unsupported.identity.salt = "tenant".to_string();
+        let notices = Mutex::new(HashMap::new());
+        let response = observe_m2_control_notice(
+            &serde_json::to_string(&unsupported).unwrap(),
+            &M2ControlTarget {
+                worker_id: 7,
+                dp_rank: 0,
+                model: "model".to_string(),
+                connector_engine_id: "engine".to_string(),
+            },
+            &notices,
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["disposition"], "rejected");
+        assert_eq!(response["reason"], "unsupported_identity");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn addressed_control_socket_acknowledges_before_demand() {
         let socket_path = PathBuf::from(format!(
@@ -1367,6 +1980,7 @@ mod m2_notice_tests {
                 connector_engine_id: "engine".to_string(),
             },
             notices.clone(),
+            None,
             socket_path.clone(),
         )
         .unwrap();
