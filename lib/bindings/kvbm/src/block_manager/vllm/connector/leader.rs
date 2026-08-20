@@ -675,7 +675,12 @@ fn validate_speculative_onboarding_notice(
     if notice.schema != M2_NOTICE_SCHEMA {
         return Err("unsupported_schema");
     }
-    if notice.request_id != actual_request_id {
+    let notice_request_id = uuid::Uuid::parse_str(&notice.request_id)
+        .map_err(|_| "request_id_mismatch")?
+        .to_string();
+    let actual_request_id =
+        dynamo_runtime::nvtx::canonical_uuid(actual_request_id).ok_or("request_id_mismatch")?;
+    if notice_request_id != actual_request_id {
         return Err("request_id_mismatch");
     }
     if actual_worker_id != Some(notice.worker_id) {
@@ -829,7 +834,8 @@ impl PyKvConnectorLeader {
             serde_json::json!({
                 "schema": 1,
                 "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
-                "request_id": actual_request_id,
+                "request_id": notice.request_id,
+                "engine_request_id": actual_request_id,
                 "component": "connector",
                 "event": "notice_received",
                 "worker_id": notice.worker_id,
@@ -851,6 +857,21 @@ impl PyKvConnectorLeader {
         request_num_tokens: usize,
         num_computed_tokens: usize,
     ) -> PyResult<(usize, bool)> {
+        if let Some(canonical_request_id) = dynamo_runtime::nvtx::canonical_uuid(&request_id)
+            && self.m2_dry_run_notices.contains_key(&canonical_request_id)
+        {
+            tracing::info!(
+                "DYN_M2_TRACE {}",
+                serde_json::json!({
+                    "schema": 1,
+                    "ts_ns": dynamo_runtime::nvtx::monotonic_ns(),
+                    "request_id": canonical_request_id,
+                    "engine_request_id": request_id,
+                    "component": "connector",
+                    "event": "connector_match_start",
+                })
+            );
+        }
         self.connector_leader
             .get_num_new_matched_tokens(request_id, request_num_tokens, num_computed_tokens)
             .map_err(to_pyerr)
@@ -961,29 +982,43 @@ mod m2_notice_tests {
         }
     }
 
+    const REQUEST_ID: &str = "11111111-1111-4111-8111-111111111111";
+
     fn validate(value: &str) -> Result<SpeculativeOnboardingNotice, &'static str> {
-        validate_speculative_onboarding_notice(value, "request-1", Some(7), 0, "model", "", None)
+        validate_speculative_onboarding_notice(value, REQUEST_ID, Some(7), 0, "model", "", None)
     }
 
     #[test]
     fn validates_schema_target_identity_and_hash_bounds() {
-        let valid = serde_json::to_string(&notice("request-1")).unwrap();
-        assert_eq!(validate(&valid), Ok(notice("request-1")));
+        let valid = serde_json::to_string(&notice(REQUEST_ID)).unwrap();
+        assert_eq!(validate(&valid), Ok(notice(REQUEST_ID)));
+        assert_eq!(
+            validate_speculative_onboarding_notice(
+                &valid,
+                &format!("{REQUEST_ID}-bdc779c6"),
+                Some(7),
+                0,
+                "model",
+                "",
+                None,
+            ),
+            Ok(notice(REQUEST_ID))
+        );
         assert_eq!(validate("{}"), Err("invalid_schema"));
 
-        let mut wrong_request = notice("other-request");
+        let mut wrong_request = notice("22222222-2222-4222-8222-222222222222");
         assert_eq!(
             validate(&serde_json::to_string(&wrong_request).unwrap()),
             Err("request_id_mismatch")
         );
-        wrong_request.request_id = "request-1".to_string();
+        wrong_request.request_id = REQUEST_ID.to_string();
         wrong_request.identity.model = "other-model".to_string();
         assert_eq!(
             validate(&serde_json::to_string(&wrong_request).unwrap()),
             Err("identity_mismatch")
         );
 
-        let mut bad_bounds = notice("request-1");
+        let mut bad_bounds = notice(REQUEST_ID);
         bad_bounds.predicted_disk_blocks = 1;
         assert_eq!(
             validate(&serde_json::to_string(&bad_bounds).unwrap()),
@@ -993,15 +1028,15 @@ mod m2_notice_tests {
 
     #[test]
     fn missing_or_wrong_dispatch_target_fails_closed() {
-        let value = serde_json::to_string(&notice("request-1")).unwrap();
+        let value = serde_json::to_string(&notice(REQUEST_ID)).unwrap();
         assert_eq!(
-            validate_speculative_onboarding_notice(&value, "request-1", None, 0, "model", "", None,),
+            validate_speculative_onboarding_notice(&value, REQUEST_ID, None, 0, "model", "", None,),
             Err("worker_id_mismatch")
         );
         assert_eq!(
             validate_speculative_onboarding_notice(
                 &value,
-                "request-1",
+                REQUEST_ID,
                 Some(7),
                 1,
                 "model",
@@ -1016,14 +1051,14 @@ mod m2_notice_tests {
     fn duplicate_is_idempotent_and_conflict_rejects() {
         let mut notices = HashMap::new();
         assert_eq!(
-            record_speculative_onboarding_notice(&mut notices, notice("request-1")),
+            record_speculative_onboarding_notice(&mut notices, notice(REQUEST_ID)),
             Ok("accepted")
         );
         assert_eq!(
-            record_speculative_onboarding_notice(&mut notices, notice("request-1")),
+            record_speculative_onboarding_notice(&mut notices, notice(REQUEST_ID)),
             Ok("duplicate")
         );
-        let mut conflict = notice("request-1");
+        let mut conflict = notice(REQUEST_ID);
         conflict.state_version += 1;
         assert_eq!(
             record_speculative_onboarding_notice(&mut notices, conflict),
