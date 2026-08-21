@@ -1386,6 +1386,13 @@ fn observe_m2_control_notice(
     .expect("M2 control acknowledgement is serializable")
 }
 
+async fn run_m2_control_blocking<F>(operation: F) -> Result<String, tokio::task::JoinError>
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation).await
+}
+
 #[derive(Debug)]
 struct M2ControlServer {
     cancel: CancellationToken,
@@ -1454,12 +1461,34 @@ impl M2ControlServer {
                         {
                             request.pop();
                             match std::str::from_utf8(&request) {
-                                Ok(request) => observe_m2_control_notice(
-                                    request,
-                                    &target,
-                                    &notices,
-                                    staging.as_ref(),
-                                ),
+                                Ok(request) => {
+                                    let request = request.to_string();
+                                    match run_m2_control_blocking(move || {
+                                        observe_m2_control_notice(
+                                            &request,
+                                            &target,
+                                            &notices,
+                                            staging.as_ref(),
+                                        )
+                                    })
+                                    .await
+                                    {
+                                        Ok(response) => response,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                %error,
+                                                "M2 control admission task failed closed"
+                                            );
+                                            serde_json::json!({
+                                                "schema": M2_NOTICE_SCHEMA,
+                                                "status": "ok",
+                                                "disposition": "rejected",
+                                                "reason": "control_unavailable",
+                                            })
+                                            .to_string()
+                                        }
+                                    }
+                                }
                                 Err(_) => serde_json::json!({
                                     "schema": M2_NOTICE_SCHEMA,
                                     "status": "ok",
@@ -1962,6 +1991,23 @@ mod m2_notice_tests {
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["disposition"], "rejected");
         assert_eq!(response["reason"], "unsupported_identity");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_admission_runs_on_blocking_executor() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send("accepted").unwrap();
+
+        let response = run_m2_control_blocking(move || {
+            receiver
+                .blocking_recv()
+                .expect("blocking admission input remains available")
+                .to_string()
+        })
+        .await
+        .expect("blocking admission task succeeds");
+
+        assert_eq!(response, "accepted");
     }
 
     #[tokio::test(flavor = "multi_thread")]
