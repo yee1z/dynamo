@@ -541,6 +541,19 @@ impl SyncIndexer for LowerTierIndexer {
                 } => {
                     self.remove_worker_dp_rank(&mut worker_blocks, worker_id, dp_rank);
                 }
+                WorkerTask::ResolveLocalHashes {
+                    worker,
+                    block_hashes,
+                    resp,
+                } => {
+                    let resolved = worker_blocks.get(&worker).and_then(|worker_map| {
+                        block_hashes
+                            .iter()
+                            .map(|hash| worker_map.get(hash).map(|key| key.local_hash))
+                            .collect()
+                    });
+                    let _ = resp.send(resolved);
+                }
                 WorkerTask::DumpEvents(sender) => {
                     let _ = sender.send(Ok(Self::dump_events(&worker_blocks)));
                 }
@@ -887,6 +900,40 @@ mod tests {
         let workers = index.root_workers(LocalBlockHash(11));
         assert_eq!(workers.len(), 1);
         assert!(workers.contains(&WorkerWithDpRank::new(7, 0)));
+    }
+
+    #[tokio::test]
+    async fn thread_pool_resolves_remove_hashes_through_existing_worker_lookup() {
+        let index = ThreadPoolIndexer::new(LowerTierIndexer::new(), 2, 1);
+        let worker = WorkerWithDpRank::new(43, 1);
+        index
+            .apply_event(store_event(43, 1, 0, None, &[11, 12], &[101, 102]))
+            .await;
+
+        assert_eq!(
+            index
+                .resolve_local_hashes(
+                    worker,
+                    vec![
+                        ExternalSequenceBlockHash(101),
+                        ExternalSequenceBlockHash(102)
+                    ],
+                )
+                .await,
+            Some(local_hashes(&[11, 12]))
+        );
+        assert_eq!(
+            index
+                .resolve_local_hashes(worker, vec![ExternalSequenceBlockHash(999)])
+                .await,
+            None
+        );
+
+        assert!(
+            !index
+                .apply_event_checked(remove_event(43, 1, 2, vec![ExternalSequenceBlockHash(999)],))
+                .await
+        );
     }
 
     #[tokio::test]

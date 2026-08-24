@@ -607,6 +607,7 @@ where
         let supports_overlap_refresh = self.scheduler.supports_overlap_refresh();
         let retain_block_hashes =
             supports_overlap_refresh || return_routing_hashes || m2_request_id.is_some();
+        let lower_tier_tickets = self.lower_tier_state.read_tickets();
 
         let TieredLookupResult {
             tiered_matches,
@@ -629,6 +630,30 @@ where
                 .as_deref()
                 .map(compute_seq_hash_for_block)
         });
+        let mut overlap =
+            OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
+                .signals();
+        let expected_identity = self.lower_tier_identity.with_adapter(lora_name.clone());
+        let now = Instant::now();
+        let query_hashes = retained_block_hashes.as_deref().unwrap_or_default();
+        for (&worker_id, config) in self.workers_with_configs.borrow().iter() {
+            let start = config.data_parallel_start_rank();
+            let end = start.saturating_add(config.data_parallel_size());
+            for dp_rank in start..end {
+                let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                overlap.lower_tier_state.insert(
+                    worker,
+                    self.lower_tier_state.view_for_query(
+                        worker,
+                        &expected_identity,
+                        query_hashes,
+                        lower_tier_tickets.get(&worker),
+                        now,
+                    ),
+                );
+            }
+        }
+        drop(tiered_matches);
         let (block_hashes_for_refresh, routing_block_hashes) =
             if supports_overlap_refresh || return_routing_hashes {
                 retained_block_hashes
@@ -644,23 +669,6 @@ where
                 (None, None)
             };
 
-        let mut overlap =
-            OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
-                .signals();
-        let expected_identity = self.lower_tier_identity.with_adapter(lora_name.clone());
-        let now = Instant::now();
-        for (&worker_id, config) in self.workers_with_configs.borrow().iter() {
-            let start = config.data_parallel_start_rank();
-            let end = start.saturating_add(config.data_parallel_size());
-            for dp_rank in start..end {
-                let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-                overlap.lower_tier_state.insert(
-                    worker,
-                    self.lower_tier_state.view(worker, &expected_identity, now),
-                );
-            }
-        }
-        drop(tiered_matches);
         let find_matches_elapsed = start.elapsed();
 
         // Capture shared cache info for metrics before moving into schedule().

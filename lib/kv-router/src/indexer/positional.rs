@@ -250,6 +250,9 @@ impl SyncIndexer for PositionalIndexer {
                 } => {
                     self.remove_worker_dp_rank_impl(&mut worker_blocks, worker_id, dp_rank);
                 }
+                WorkerTask::ResolveLocalHashes { resp, .. } => {
+                    let _ = resp.send(None);
+                }
                 WorkerTask::CleanupStaleChildren => {
                     self.run_cleanup_task();
                 }

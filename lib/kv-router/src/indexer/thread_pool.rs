@@ -234,6 +234,66 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         Arc::clone(&self.backend)
     }
 
+    /// Resolve opaque event hashes through the worker-local lookup owned by
+    /// the sticky event thread. Unsupported backends return `None`.
+    pub async fn resolve_local_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        block_hashes: Vec<ExternalSequenceBlockHash>,
+    ) -> Option<Vec<LocalBlockHash>> {
+        let thread_idx = Self::get_or_assign_thread_idx(
+            &self.worker_assignments,
+            &self.worker_assignment_count,
+            worker.worker_id,
+            self.num_workers,
+        );
+        let (resp, result) = oneshot::channel();
+        self.worker_event_channels[thread_idx]
+            .send(WorkerTask::ResolveLocalHashes {
+                worker,
+                block_hashes,
+                resp,
+            })
+            .ok()?;
+        result.await.ok().flatten()
+    }
+
+    /// Apply one event and report whether the owning worker accepted it.
+    pub async fn apply_event_checked(&self, event: RouterEvent) -> bool {
+        let worker_id = event.worker_id;
+        let thread_idx = Self::get_or_assign_thread_idx(
+            &self.worker_assignments,
+            &self.worker_assignment_count,
+            worker_id,
+            self.num_workers,
+        );
+        let (resp, result) = oneshot::channel();
+        if let Err(error) =
+            self.worker_event_channels[thread_idx].send(WorkerTask::EventWithAck { event, resp })
+        {
+            tracing::error!(thread_idx, ?error, "Failed to send index event");
+            return false;
+        }
+        match result.await {
+            Ok(true) => {
+                self.maybe_enqueue_cleanup(thread_idx);
+                true
+            }
+            Ok(false) => {
+                tracing::warn!(thread_idx, "Worker thread rejected an index event");
+                false
+            }
+            Err(error) => {
+                tracing::error!(
+                    thread_idx,
+                    ?error,
+                    "Worker thread dropped event acknowledgment"
+                );
+                false
+            }
+        }
+    }
+
     pub(crate) async fn worker_lookup_stats(&self) -> WorkerLookupStats {
         let mut receivers = Vec::new();
         for channel in &self.worker_event_channels {
@@ -291,17 +351,27 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
     ///
     /// Used primarily for testing and benchmarking to ensure writes are visible
     /// before checking results.
-    pub async fn flush(&self) {
+    pub async fn flush_checked(&self) -> bool {
         let mut receivers = Vec::new();
+        let mut flushed = true;
         for channel in &self.worker_event_channels {
             let (resp_tx, resp_rx) = oneshot::channel();
-            if channel.send(WorkerTask::Flush(resp_tx)).is_ok() {
+            if channel.send(WorkerTask::Flush(resp_tx)).is_err() {
+                flushed = false;
+            } else {
                 receivers.push(resp_rx);
             }
         }
         for receiver in receivers {
-            let _ = receiver.await;
+            if receiver.await.is_err() {
+                flushed = false;
+            }
         }
+        flushed
+    }
+
+    pub async fn flush(&self) {
+        let _ = self.flush_checked().await;
     }
 
     fn get_or_assign_thread_idx(
@@ -614,44 +684,7 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
     }
 
     async fn apply_event(&self, event: RouterEvent) {
-        let worker_id = event.worker_id;
-
-        // Get or assign worker thread index using sticky round-robin
-        let thread_idx = Self::get_or_assign_thread_idx(
-            &self.worker_assignments,
-            &self.worker_assignment_count,
-            worker_id,
-            self.num_workers,
-        );
-
-        // State consumers treat completion of this async method as the event's
-        // visibility boundary, so wait for the worker to apply it rather than
-        // returning after enqueue.
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if let Err(e) = self.worker_event_channels[thread_idx].send(WorkerTask::EventWithAck {
-            event,
-            resp: resp_tx,
-        }) {
-            tracing::error!(
-                "Failed to send event to worker thread {}: {:?}",
-                thread_idx,
-                e
-            );
-            return;
-        }
-
-        match resp_rx.await {
-            Ok(true) => self.maybe_enqueue_cleanup(thread_idx),
-            Ok(false) => tracing::warn!(
-                "Worker thread {} rejected an index event",
-                thread_idx
-            ),
-            Err(e) => tracing::error!(
-                "Worker thread {} dropped an index event acknowledgment: {:?}",
-                thread_idx,
-                e
-            ),
-        }
+        let _ = self.apply_event_checked(event).await;
     }
 
     async fn remove_worker(&self, worker_id: WorkerId) {
@@ -830,7 +863,7 @@ mod tests {
         test_utils::{assert_score, make_store_event},
     };
     use std::{
-        sync::{atomic::AtomicBool, Condvar},
+        sync::{Condvar, atomic::AtomicBool},
         time::Duration,
     };
 
@@ -939,10 +972,9 @@ mod tests {
             task_indexer.apply_event(make_store_event(1, &[1])).await;
         });
 
-        let waited_for_worker =
-            tokio::time::timeout(Duration::from_millis(100), &mut apply_task)
-                .await
-                .is_err();
+        let waited_for_worker = tokio::time::timeout(Duration::from_millis(100), &mut apply_task)
+            .await
+            .is_err();
         assert!(
             !indexer
                 .backend

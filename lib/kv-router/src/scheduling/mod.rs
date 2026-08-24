@@ -20,8 +20,8 @@ pub use filter::*;
 pub use local::LocalScheduler;
 pub use lower_tier_state::{
     CacheIdentity, LowerTierApplyResult, LowerTierFallbackReason, LowerTierPredictionDisposition,
-    LowerTierStateLedger, LowerTierStateStatus, LowerTierStateUpdate, LowerTierStateView,
-    LowerTierUpdateKind, qualify_lower_tier_prediction,
+    LowerTierReadTicket, LowerTierStateLedger, LowerTierStateStatus, LowerTierStateUpdate,
+    LowerTierStateView, LowerTierUpdateFence, LowerTierUpdateKind, qualify_lower_tier_prediction,
 };
 pub use overlap::{
     CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals,

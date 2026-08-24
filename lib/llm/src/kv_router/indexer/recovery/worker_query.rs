@@ -23,7 +23,10 @@ use crate::kv_router::Indexer;
 use dynamo_kv_router::{
     indexer::WorkerKvQueryResponse,
     protocols::{DpRank, KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank},
-    scheduling::{CacheIdentity, LowerTierStateLedger, LowerTierStateUpdate, LowerTierUpdateKind},
+    scheduling::{
+        CacheIdentity, LowerTierStateLedger, LowerTierStateUpdate, LowerTierUpdateFence,
+        LowerTierUpdateKind,
+    },
 };
 
 #[cfg(test)]
@@ -258,9 +261,80 @@ impl WorkerQueryClient {
         );
     }
 
-    fn begin_state_update(&self, worker_id: WorkerId, dp_rank: DpRank) {
-        self.lower_tier_state
-            .begin_update(WorkerWithDpRank::new(worker_id, dp_rank));
+    async fn event_fence(&self, event: &RouterEvent) -> LowerTierUpdateFence {
+        match &event.event.data {
+            KvCacheEventData::Stored(store) if !store.blocks.is_empty() => {
+                LowerTierUpdateFence::keys(store.blocks.iter().map(|block| block.tokens_hash))
+            }
+            KvCacheEventData::Removed(remove) if !remove.block_hashes.is_empty() => self
+                .indexer
+                .resolve_lower_tier_local_hashes(
+                    WorkerWithDpRank::new(event.worker_id, event.event.dp_rank),
+                    event.storage_tier,
+                    remove.block_hashes.clone(),
+                )
+                .await
+                .filter(|keys| !keys.is_empty())
+                .map(LowerTierUpdateFence::keys)
+                .unwrap_or_else(LowerTierUpdateFence::whole_worker),
+            KvCacheEventData::Stored(_)
+            | KvCacheEventData::Removed(_)
+            | KvCacheEventData::Cleared => LowerTierUpdateFence::whole_worker(),
+        }
+    }
+
+    fn events_fence(events: &[RouterEvent]) -> LowerTierUpdateFence {
+        if events.is_empty()
+            || events
+                .iter()
+                .any(|event| !matches!(event.event.data, KvCacheEventData::Stored(_)))
+        {
+            return LowerTierUpdateFence::whole_worker();
+        }
+        let keys = events
+            .iter()
+            .flat_map(|event| match &event.event.data {
+                KvCacheEventData::Stored(store) => {
+                    store.blocks.iter().map(|block| block.tokens_hash)
+                }
+                _ => unreachable!("non-store events returned above"),
+            })
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            LowerTierUpdateFence::whole_worker()
+        } else {
+            LowerTierUpdateFence::keys(keys)
+        }
+    }
+
+    fn begin_state_update(
+        &self,
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        fence: LowerTierUpdateFence,
+    ) {
+        let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+        self.lower_tier_state.begin_update(worker, fence);
+        let view = self
+            .lower_tier_state
+            .view(worker, &self.cache_identity, Instant::now());
+        tracing::info!(
+            "DYN_PHASE_D_STATE_UPDATE {}",
+            serde_json::json!({
+                "schema": 1,
+                "router_receipt_ns": crate::kv_router::monotonic_ns(),
+                "worker_id": worker_id,
+                "dp_rank": dp_rank,
+                "kind": "update_in_flight",
+                "worker_epoch": view.worker_epoch,
+                "version": view.version,
+                "identity_digest": Self::state_digest(&self.cache_identity),
+                "summary_digest": 0,
+                "apply_result": "update_in_flight",
+                "resulting_status": view.status.as_str(),
+                "fallback_reason": view.fallback_reason.as_str(),
+            })
+        );
     }
 
     fn query_target_for(&self, worker_id: WorkerId, dp_rank: DpRank) -> Option<Instance> {
@@ -408,7 +482,11 @@ impl WorkerQueryClient {
         }
     }
 
-    async fn apply_worker_clear_locked(&self, worker_state: &mut WorkerState, event: RouterEvent) {
+    async fn apply_worker_clear_locked(
+        &self,
+        worker_state: &mut WorkerState,
+        event: RouterEvent,
+    ) -> bool {
         let worker_id = event.worker_id;
         let clear_dp_rank = event.event.dp_rank;
         let clear_event_id = event.event.event_id;
@@ -427,7 +505,7 @@ impl WorkerQueryClient {
             "Applying clear barrier for worker {worker_id}; invalidating recovery across {} dp_ranks",
             worker_state.ranks.len()
         );
-        self.indexer.apply_event(event).await;
+        self.indexer.apply_event(event).await
     }
 
     async fn apply_tree_dump_replace_locked(
@@ -435,11 +513,17 @@ impl WorkerQueryClient {
         worker_id: WorkerId,
         dp_rank: DpRank,
         events: Vec<RouterEvent>,
-    ) {
+    ) -> bool {
         self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
-        for event in events {
-            self.indexer.apply_event(event).await;
+        if !self.indexer.flush_indexers_checked().await {
+            return false;
         }
+        for event in events {
+            if !self.indexer.apply_event(event).await {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) async fn handle_live_event(self: &Arc<Self>, event: RouterEvent) {
@@ -464,7 +548,10 @@ impl WorkerQueryClient {
                         event.event.event_id.saturating_add(1),
                         Self::state_digest(&event),
                     );
-                    self.indexer.apply_event(event).await;
+                    if !self.indexer.apply_event(event).await {
+                        self.mark_propagation_failure(worker_id, dp_rank);
+                        return;
+                    }
                     return;
                 }
                 action => action,
@@ -485,8 +572,12 @@ impl WorkerQueryClient {
                 };
                 let version = event.event.event_id.saturating_add(1);
                 let summary_digest = Self::state_digest(&event);
-                self.begin_state_update(worker_id, dp_rank);
-                self.indexer.apply_event(event).await;
+                let fence = self.event_fence(&event).await;
+                self.begin_state_update(worker_id, dp_rank, fence);
+                if !self.indexer.apply_event(event).await {
+                    self.mark_propagation_failure(worker_id, dp_rank);
+                    return;
+                }
                 self.apply_state_update(
                     worker_id,
                     dp_rank,
@@ -624,41 +715,52 @@ impl WorkerQueryClient {
                 last_event_id,
             }) => {
                 let summary_digest = Self::state_digest(&events);
-                self.begin_state_update(key.0, key.1);
+                self.begin_state_update(key.0, key.1, Self::events_fence(&events));
                 tracing::debug!(
                     "Got {count} buffered events from worker {} dp_rank {}",
                     key.0,
                     key.1,
                     count = events.len()
                 );
+                let mut applied = true;
                 for event in events {
                     let event_id = event.event.event_id;
                     if matches!(&event.event.data, KvCacheEventData::Cleared) {
-                        self.apply_worker_clear_locked(&mut worker_state, event)
-                            .await;
+                        if !self
+                            .apply_worker_clear_locked(&mut worker_state, event)
+                            .await
+                        {
+                            applied = false;
+                            break;
+                        }
                         new_cursor = new_cursor.apply_barrier(event_id);
                         continue;
                     }
-                    self.indexer.apply_event(event).await;
+                    if !self.indexer.apply_event(event).await {
+                        applied = false;
+                        break;
+                    }
                     new_cursor = new_cursor.advance_to(event_id);
                 }
-                new_cursor = new_cursor.advance_to(last_event_id);
-                self.apply_state_update(
-                    key.0,
-                    key.1,
-                    LowerTierUpdateKind::Incremental,
-                    epoch,
-                    last_event_id.saturating_add(1),
-                    summary_digest,
-                );
-                successful_response = true;
+                if applied {
+                    new_cursor = new_cursor.advance_to(last_event_id);
+                    self.apply_state_update(
+                        key.0,
+                        key.1,
+                        LowerTierUpdateKind::Incremental,
+                        epoch,
+                        last_event_id.saturating_add(1),
+                        summary_digest,
+                    );
+                    successful_response = true;
+                }
             }
             Ok(WorkerKvQueryResponse::TreeDump {
                 events,
                 last_event_id,
             }) => {
                 let summary_digest = Self::state_digest(&events);
-                self.begin_state_update(key.0, key.1);
+                self.begin_state_update(key.0, key.1, LowerTierUpdateFence::whole_worker());
                 let represented_blocks = events
                     .iter()
                     .map(|event| match &event.event.data {
@@ -674,18 +776,21 @@ impl WorkerQueryClient {
                     last_event_id,
                     "Got tree dump (range too old or unspecified)"
                 );
-                self.apply_tree_dump_replace_locked(key.0, key.1, events)
-                    .await;
-                self.apply_state_update(
-                    key.0,
-                    key.1,
-                    LowerTierUpdateKind::Snapshot,
-                    epoch,
-                    last_event_id.saturating_add(1),
-                    summary_digest,
-                );
-                new_cursor = new_cursor.advance_to(last_event_id);
-                successful_response = true;
+                if self
+                    .apply_tree_dump_replace_locked(key.0, key.1, events)
+                    .await
+                {
+                    self.apply_state_update(
+                        key.0,
+                        key.1,
+                        LowerTierUpdateKind::Snapshot,
+                        epoch,
+                        last_event_id.saturating_add(1),
+                        summary_digest,
+                    );
+                    new_cursor = new_cursor.advance_to(last_event_id);
+                    successful_response = true;
+                }
             }
             Ok(WorkerKvQueryResponse::TooNew {
                 newest_available, ..
@@ -728,13 +833,24 @@ impl WorkerQueryClient {
                 match worker_state.next_pending_drain_action(key.1) {
                     PendingDrainAction::Apply(event) => {
                         if matches!(&event.event.data, KvCacheEventData::Cleared) {
-                            self.apply_worker_clear_locked(&mut worker_state, event)
-                                .await;
+                            if !self
+                                .apply_worker_clear_locked(&mut worker_state, event)
+                                .await
+                            {
+                                worker_state.finish_failed_recovery(key.1);
+                                self.mark_propagation_failure(key.0, key.1);
+                                break;
+                            }
                         } else {
                             let version = event.event.event_id.saturating_add(1);
                             let summary_digest = Self::state_digest(&event);
-                            self.begin_state_update(key.0, key.1);
-                            self.indexer.apply_event(event).await;
+                            let fence = self.event_fence(&event).await;
+                            self.begin_state_update(key.0, key.1, fence);
+                            if !self.indexer.apply_event(event).await {
+                                worker_state.finish_failed_recovery(key.1);
+                                self.mark_propagation_failure(key.0, key.1);
+                                break;
+                            }
                             self.apply_state_update(
                                 key.0,
                                 key.1,
@@ -850,8 +966,8 @@ mod tests {
     use crate::kv_router::{Indexer, indexer::LowerTierIndexers};
     use dynamo_kv_router::indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics};
     use dynamo_kv_router::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
-        KvCacheStoredBlockData, LocalBlockHash, RouterEvent,
+        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData,
+        KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier,
     };
     use dynamo_runtime::{
         DistributedRuntime, Runtime,
@@ -1067,6 +1183,116 @@ mod tests {
                 dp_rank,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn store_and_resolved_remove_updates_use_key_fences_but_unknown_remove_fails_closed() {
+        let (client, _transport, _indexer) = make_test_client("update-fences").await;
+        let lower_tier_store = RouterEvent::with_storage_tier(
+            1,
+            make_store_event(1, 0, 7).event,
+            StorageTier::HostPinned,
+        );
+        assert_eq!(
+            client.event_fence(&lower_tier_store).await,
+            LowerTierUpdateFence::keys([LocalBlockHash(7)])
+        );
+        client.indexer.apply_event(lower_tier_store).await;
+
+        let resolved_remove = RouterEvent::with_storage_tier(
+            1,
+            KvCacheEvent {
+                event_id: 8,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(7)],
+                }),
+                dp_rank: 0,
+            },
+            StorageTier::HostPinned,
+        );
+        assert_eq!(
+            client.event_fence(&resolved_remove).await,
+            LowerTierUpdateFence::keys([LocalBlockHash(7)])
+        );
+
+        let unknown_remove = RouterEvent::with_storage_tier(
+            1,
+            KvCacheEvent {
+                event_id: 9,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(999)],
+                }),
+                dp_rank: 0,
+            },
+            StorageTier::HostPinned,
+        );
+        assert_eq!(
+            client.event_fence(&unknown_remove).await,
+            LowerTierUpdateFence::WholeWorker
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_incremental_marks_real_propagation_failure() {
+        let (client, transport, _indexer) = make_test_client("rejected-incremental").await;
+        let key = (1, 0);
+        let initial = RouterEvent::with_storage_tier(
+            key.0,
+            make_store_event(key.0, key.1, 7).event,
+            StorageTier::HostPinned,
+        );
+        transport.push_action(
+            key,
+            MockQueryAction {
+                started: None,
+                release: None,
+                response: Ok(WorkerKvQueryResponse::TreeDump {
+                    events: vec![initial],
+                    last_event_id: 7,
+                }),
+            },
+        );
+        client.handle_discovered_worker(key.0, key.1).await;
+        wait_for(|| {
+            rank_state_matches(&client, key, |state| {
+                state.last_applied_id() == Some(7) && !state.recovery_inflight
+            })
+        })
+        .await;
+
+        let worker = WorkerWithDpRank::new(key.0, key.1);
+        assert_eq!(
+            client
+                .lower_tier_state
+                .view(worker, &client.cache_identity, Instant::now())
+                .status,
+            dynamo_kv_router::scheduling::LowerTierStateStatus::Known
+        );
+
+        let rejected = RouterEvent::with_storage_tier(
+            key.0,
+            KvCacheEvent {
+                event_id: 8,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(999)],
+                }),
+                dp_rank: key.1,
+            },
+            StorageTier::HostPinned,
+        );
+        client.handle_live_event(rejected).await;
+
+        let failed = client
+            .lower_tier_state
+            .view(worker, &client.cache_identity, Instant::now());
+        assert_eq!(
+            failed.status,
+            dynamo_kv_router::scheduling::LowerTierStateStatus::Unknown
+        );
+        assert_eq!(
+            failed.fallback_reason,
+            dynamo_kv_router::scheduling::LowerTierFallbackReason::PropagationFailure
+        );
     }
 
     fn stored_block_hashes(events: &[RouterEvent]) -> Vec<u64> {

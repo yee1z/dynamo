@@ -612,6 +612,9 @@ impl SyncIndexer for ConcurrentRadixTree {
                 } => {
                     self.remove_worker_dp_rank(&mut lookup, worker_id, dp_rank);
                 }
+                WorkerTask::ResolveLocalHashes { resp, .. } => {
+                    let _ = resp.send(None);
+                }
                 WorkerTask::CleanupStaleChildren => {
                     self.run_cleanup_task();
                 }

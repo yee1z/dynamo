@@ -482,6 +482,12 @@ pub enum WorkerTask {
         /// True for the one shared-state backend task that owns structural cleanup.
         sweep_tree: bool,
     },
+    /// Resolve opaque worker event hashes through the owning indexer's existing lookup.
+    ResolveLocalHashes {
+        worker: WorkerWithDpRank,
+        block_hashes: Vec<ExternalSequenceBlockHash>,
+        resp: oneshot::Sender<Option<Vec<LocalBlockHash>>>,
+    },
     /// Best-effort maintenance task for shared-state backends.
     CleanupStaleChildren,
     DumpEvents(oneshot::Sender<anyhow::Result<Vec<RouterEvent>>>),

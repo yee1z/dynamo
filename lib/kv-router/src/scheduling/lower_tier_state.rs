@@ -10,9 +10,9 @@
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::protocols::WorkerWithDpRank;
+use crate::protocols::{LocalBlockHash, WorkerWithDpRank};
 
 /// Cache identity fields that must agree before lower-tier state is reusable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -105,6 +105,7 @@ pub enum LowerTierFallbackReason {
     None,
     AwaitingInitialSnapshot,
     AwaitingSnapshotAfterReset,
+    UpdateInFlight,
     PropagationFailure,
     Expired,
     IdentityMismatch,
@@ -117,12 +118,57 @@ impl LowerTierFallbackReason {
             Self::None => "none",
             Self::AwaitingInitialSnapshot => "awaiting_initial_snapshot",
             Self::AwaitingSnapshotAfterReset => "awaiting_snapshot_after_reset",
+            Self::UpdateInFlight => "update_in_flight",
             Self::PropagationFailure => "propagation_failure",
             Self::Expired => "expired",
             Self::IdentityMismatch => "identity_mismatch",
             Self::ConflictingReplay => "conflicting_replay",
         }
     }
+}
+
+/// Query keys fenced while one accepted index update is being applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LowerTierUpdateFence {
+    WholeWorker,
+    Keys(FxHashSet<LocalBlockHash>),
+}
+
+impl LowerTierUpdateFence {
+    pub fn whole_worker() -> Self {
+        Self::WholeWorker
+    }
+
+    pub fn keys(keys: impl IntoIterator<Item = LocalBlockHash>) -> Self {
+        Self::Keys(keys.into_iter().collect())
+    }
+
+    fn affects(&self, query_keys: &[LocalBlockHash]) -> bool {
+        match self {
+            Self::WholeWorker => true,
+            Self::Keys(keys) => query_keys.iter().any(|key| keys.contains(key)),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match (&mut *self, other) {
+            (Self::WholeWorker, _) => {}
+            (slot, Self::WholeWorker) => *slot = Self::WholeWorker,
+            (Self::Keys(keys), Self::Keys(other)) => keys.extend(other),
+        }
+    }
+}
+
+/// Publication generation captured immediately before an index lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LowerTierReadTicket {
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PublishedFence {
+    from_generation: u64,
+    fence: LowerTierUpdateFence,
 }
 
 /// Immutable request-time view used by scheduling and tracing.
@@ -196,7 +242,9 @@ struct LedgerEntry {
     observed_at: Instant,
     status: LowerTierStateStatus,
     fallback_reason: LowerTierFallbackReason,
-    transitioning_from_known: bool,
+    generation: u64,
+    pending_fence: Option<LowerTierUpdateFence>,
+    last_published_fence: Option<PublishedFence>,
 }
 
 impl LedgerEntry {
@@ -225,7 +273,9 @@ impl LedgerEntry {
             observed_at,
             status,
             fallback_reason,
-            transitioning_from_known: false,
+            generation: 1,
+            pending_fence: None,
+            last_published_fence: None,
         }
     }
 }
@@ -268,7 +318,12 @@ impl LowerTierStateLedger {
                     let mut conflict = existing.clone();
                     conflict.status = LowerTierStateStatus::Conflict;
                     conflict.fallback_reason = LowerTierFallbackReason::ConflictingReplay;
-                    conflict.transitioning_from_known = false;
+                    conflict.generation = conflict.generation.saturating_add(1);
+                    conflict.pending_fence = None;
+                    conflict.last_published_fence = Some(PublishedFence {
+                        from_generation: existing.generation,
+                        fence: LowerTierUpdateFence::WholeWorker,
+                    });
                     entries.insert(update.worker, conflict);
                     return LowerTierApplyResult::Conflict;
                 }
@@ -279,6 +334,12 @@ impl LowerTierStateLedger {
                         LowerTierStateStatus::Conflict,
                         LowerTierFallbackReason::ConflictingReplay,
                     );
+                    let mut conflict = conflict;
+                    conflict.generation = existing.generation.saturating_add(1);
+                    conflict.last_published_fence = Some(PublishedFence {
+                        from_generation: existing.generation,
+                        fence: LowerTierUpdateFence::WholeWorker,
+                    });
                     entries.insert(update.worker, conflict);
                     return LowerTierApplyResult::Conflict;
                 }
@@ -300,10 +361,8 @@ impl LowerTierStateLedger {
             LowerTierUpdateKind::Incremental
                 if existing.is_none()
                     || epoch_advanced
-                    || existing.is_some_and(|entry| {
-                        entry.status != LowerTierStateStatus::Known
-                            && !entry.transitioning_from_known
-                    }) =>
+                    || existing
+                        .is_some_and(|entry| entry.status != LowerTierStateStatus::Known) =>
             {
                 (
                     LowerTierStateStatus::Unknown,
@@ -318,33 +377,72 @@ impl LowerTierStateLedger {
             ),
         };
 
-        entries.insert(
-            update.worker,
-            LedgerEntry::from_update(&update, observed_at, status, fallback_reason),
-        );
+        let mut next = LedgerEntry::from_update(&update, observed_at, status, fallback_reason);
+        if let Some(existing) = existing {
+            next.generation = existing.generation.saturating_add(1);
+            let fence = if result == LowerTierApplyResult::AppliedKnown
+                && update.kind == LowerTierUpdateKind::Incremental
+            {
+                existing
+                    .pending_fence
+                    .clone()
+                    .unwrap_or(LowerTierUpdateFence::WholeWorker)
+            } else {
+                LowerTierUpdateFence::WholeWorker
+            };
+            next.last_published_fence = Some(PublishedFence {
+                from_generation: existing.generation,
+                fence,
+            });
+        }
+        entries.insert(update.worker, next);
         result
     }
 
     /// Fail closed after a propagation error while preserving the last watermark.
     pub fn mark_propagation_failure(&self, worker: WorkerWithDpRank) {
         if let Some(entry) = self.entries.write().unwrap().get_mut(&worker) {
+            let from_generation = entry.generation;
             entry.status = LowerTierStateStatus::Unknown;
             entry.fallback_reason = LowerTierFallbackReason::PropagationFailure;
-            entry.transitioning_from_known = false;
+            entry.generation = entry.generation.saturating_add(1);
+            entry.pending_fence = None;
+            entry.last_published_fence = Some(PublishedFence {
+                from_generation,
+                fence: LowerTierUpdateFence::WholeWorker,
+            });
         }
     }
 
-    /// Temporarily fail closed while the indexer applies an accepted event.
-    /// A same-epoch incremental may restore `known`; a real propagation
-    /// failure cannot.
-    pub fn begin_update(&self, worker: WorkerWithDpRank) {
+    /// Fence only the query keys changed by an accepted event while retaining
+    /// the immutable last-committed view for unrelated readers.
+    pub fn begin_update(&self, worker: WorkerWithDpRank, fence: LowerTierUpdateFence) {
         if let Some(entry) = self.entries.write().unwrap().get_mut(&worker)
             && entry.status == LowerTierStateStatus::Known
         {
-            entry.status = LowerTierStateStatus::Unknown;
-            entry.fallback_reason = LowerTierFallbackReason::PropagationFailure;
-            entry.transitioning_from_known = true;
+            if let Some(pending) = entry.pending_fence.as_mut() {
+                pending.merge(fence);
+            } else {
+                entry.pending_fence = Some(fence);
+            }
         }
+    }
+
+    /// Capture publication generations immediately before an index lookup.
+    pub fn read_tickets(&self) -> FxHashMap<WorkerWithDpRank, LowerTierReadTicket> {
+        self.entries
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(worker, entry)| {
+                (
+                    *worker,
+                    LowerTierReadTicket {
+                        generation: entry.generation,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Query a worker using router receipt time for freshness. Worker clocks are
@@ -353,6 +451,55 @@ impl LowerTierStateLedger {
         &self,
         worker: WorkerWithDpRank,
         expected_identity: &CacheIdentity,
+        now: Instant,
+    ) -> LowerTierStateView {
+        let entries = self.entries.read().unwrap();
+        let Some(entry) = entries.get(&worker) else {
+            return LowerTierStateView::default();
+        };
+        let age = now.saturating_duration_since(entry.observed_at);
+        let mut base = LowerTierStateView {
+            status: entry.status,
+            version: Some(entry.version),
+            age: Some(age),
+            worker_epoch: Some(entry.worker_epoch),
+            fallback_reason: entry.fallback_reason,
+        };
+        if entry.status == LowerTierStateStatus::Conflict {
+            return base;
+        }
+        if &entry.identity != expected_identity {
+            return LowerTierStateView {
+                status: LowerTierStateStatus::Conflict,
+                fallback_reason: LowerTierFallbackReason::IdentityMismatch,
+                ..base
+            };
+        }
+        if entry.status != LowerTierStateStatus::Known {
+            return base;
+        }
+        if entry.pending_fence.is_some() {
+            base.status = LowerTierStateStatus::Unknown;
+            base.fallback_reason = LowerTierFallbackReason::UpdateInFlight;
+            return base;
+        }
+        if age > self.stale_after {
+            return LowerTierStateView {
+                status: LowerTierStateStatus::Stale,
+                fallback_reason: LowerTierFallbackReason::Expired,
+                ..base
+            };
+        }
+        base
+    }
+
+    /// Validate one tiered lookup against its pre-query publication ticket.
+    pub fn view_for_query(
+        &self,
+        worker: WorkerWithDpRank,
+        expected_identity: &CacheIdentity,
+        query_keys: &[LocalBlockHash],
+        ticket: Option<&LowerTierReadTicket>,
         now: Instant,
     ) -> LowerTierStateView {
         let entries = self.entries.read().unwrap();
@@ -387,6 +534,35 @@ impl LowerTierStateLedger {
                 ..base
             };
         }
+        if entry
+            .pending_fence
+            .as_ref()
+            .is_some_and(|fence| fence.affects(query_keys))
+        {
+            return LowerTierStateView {
+                status: LowerTierStateStatus::Unknown,
+                fallback_reason: LowerTierFallbackReason::UpdateInFlight,
+                ..base
+            };
+        }
+
+        let generation_is_safe = ticket.is_some_and(|ticket| {
+            ticket.generation == entry.generation
+                || entry
+                    .last_published_fence
+                    .as_ref()
+                    .is_some_and(|published| {
+                        published.from_generation == ticket.generation
+                            && !published.fence.affects(query_keys)
+                    })
+        });
+        if !generation_is_safe {
+            return LowerTierStateView {
+                status: LowerTierStateStatus::Unknown,
+                fallback_reason: LowerTierFallbackReason::UpdateInFlight,
+                ..base
+            };
+        }
         base
     }
 
@@ -395,6 +571,8 @@ impl LowerTierStateLedger {
     pub fn views(
         &self,
         expected_identity: &CacheIdentity,
+        query_keys: &[LocalBlockHash],
+        tickets: &FxHashMap<WorkerWithDpRank, LowerTierReadTicket>,
         now: Instant,
     ) -> FxHashMap<WorkerWithDpRank, LowerTierStateView> {
         let workers = self
@@ -406,7 +584,18 @@ impl LowerTierStateLedger {
             .collect::<Vec<_>>();
         workers
             .into_iter()
-            .map(|worker| (worker, self.view(worker, expected_identity, now)))
+            .map(|worker| {
+                (
+                    worker,
+                    self.view_for_query(
+                        worker,
+                        expected_identity,
+                        query_keys,
+                        tickets.get(&worker),
+                        now,
+                    ),
+                )
+            })
             .collect()
     }
 }
@@ -702,7 +891,7 @@ mod tests {
         let now = Instant::now();
         ledger.apply(update(LowerTierUpdateKind::Snapshot, 1, 1, 10), now);
 
-        ledger.begin_update(worker());
+        ledger.begin_update(worker(), LowerTierUpdateFence::WholeWorker);
         let in_flight = ledger.view(worker(), &identity(None), now);
         assert_eq!(in_flight.status, LowerTierStateStatus::Unknown);
         assert_eq!(
@@ -722,6 +911,103 @@ mod tests {
                 .view(worker(), &identity(None), now + Duration::from_millis(2))
                 .status,
             LowerTierStateStatus::Known
+        );
+    }
+
+    #[test]
+    fn same_epoch_update_fences_only_affected_keys() {
+        let ledger = LowerTierStateLedger::new(Duration::from_secs(10));
+        let now = Instant::now();
+        ledger.apply(update(LowerTierUpdateKind::Snapshot, 1, 1, 10), now);
+        let tickets = ledger.read_tickets();
+
+        ledger.begin_update(worker(), LowerTierUpdateFence::keys([LocalBlockHash(20)]));
+
+        let unaffected = ledger.view_for_query(
+            worker(),
+            &identity(None),
+            &[LocalBlockHash(99)],
+            tickets.get(&worker()),
+            now,
+        );
+        assert_eq!(unaffected.status, LowerTierStateStatus::Known);
+        assert_eq!(unaffected.version, Some(1));
+
+        let affected = ledger.view_for_query(
+            worker(),
+            &identity(None),
+            &[LocalBlockHash(20)],
+            tickets.get(&worker()),
+            now,
+        );
+        assert_eq!(affected.status, LowerTierStateStatus::Unknown);
+        assert_eq!(
+            affected.fallback_reason,
+            LowerTierFallbackReason::UpdateInFlight
+        );
+    }
+
+    #[test]
+    fn query_crossing_publish_fails_closed_only_for_affected_keys() {
+        let ledger = LowerTierStateLedger::new(Duration::from_secs(10));
+        let now = Instant::now();
+        ledger.apply(update(LowerTierUpdateKind::Snapshot, 1, 1, 10), now);
+        let old_tickets = ledger.read_tickets();
+        ledger.begin_update(worker(), LowerTierUpdateFence::keys([LocalBlockHash(20)]));
+        ledger.apply(
+            update(LowerTierUpdateKind::Incremental, 1, 2, 20),
+            now + Duration::from_millis(1),
+        );
+
+        let crossed_affected = ledger.view_for_query(
+            worker(),
+            &identity(None),
+            &[LocalBlockHash(20)],
+            old_tickets.get(&worker()),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(crossed_affected.status, LowerTierStateStatus::Unknown);
+        assert_eq!(
+            crossed_affected.fallback_reason,
+            LowerTierFallbackReason::UpdateInFlight
+        );
+
+        let crossed_unaffected = ledger.view_for_query(
+            worker(),
+            &identity(None),
+            &[LocalBlockHash(99)],
+            old_tickets.get(&worker()),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(crossed_unaffected.status, LowerTierStateStatus::Known);
+        assert_eq!(crossed_unaffected.version, Some(2));
+
+        let new_tickets = ledger.read_tickets();
+        let published = ledger.view_for_query(
+            worker(),
+            &identity(None),
+            &[LocalBlockHash(20)],
+            new_tickets.get(&worker()),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(published.status, LowerTierStateStatus::Known);
+        assert_eq!(published.version, Some(2));
+    }
+
+    #[test]
+    fn real_failure_supersedes_a_narrow_update_fence() {
+        let ledger = LowerTierStateLedger::new(Duration::from_secs(10));
+        let now = Instant::now();
+        ledger.apply(update(LowerTierUpdateKind::Snapshot, 1, 1, 10), now);
+        ledger.begin_update(worker(), LowerTierUpdateFence::keys([LocalBlockHash(20)]));
+        ledger.mark_propagation_failure(worker());
+
+        let failed =
+            ledger.view_for_query(worker(), &identity(None), &[LocalBlockHash(99)], None, now);
+        assert_eq!(failed.status, LowerTierStateStatus::Unknown);
+        assert_eq!(
+            failed.fallback_reason,
+            LowerTierFallbackReason::PropagationFailure
         );
     }
 }

@@ -98,6 +98,10 @@ impl<P: TieredMatchProvider> OverlapScoresRefresh for TieredOverlapRefresher<P> 
         if block_hashes.is_empty() {
             return None;
         }
+        let state_tickets = self
+            .lower_tier_state
+            .as_ref()
+            .map(|state| state.read_tickets());
         let tiered = match self.provider.find_tiered_matches(block_hashes).await {
             Ok(tiered) => tiered,
             Err(error) => {
@@ -108,7 +112,14 @@ impl<P: TieredMatchProvider> OverlapScoresRefresh for TieredOverlapRefresher<P> 
         let mut overlap = OverlapAnalysis::new(&self.config, self.block_size, &tiered).signals();
         if let (Some(state), Some(identity)) = (&self.lower_tier_state, &self.lower_tier_identity) {
             let expected_identity = identity.with_adapter(lora_name.map(str::to_string));
-            overlap.lower_tier_state = state.views(&expected_identity, Instant::now());
+            overlap.lower_tier_state = state.views(
+                &expected_identity,
+                block_hashes,
+                state_tickets
+                    .as_ref()
+                    .expect("tickets exist when lower-tier state exists"),
+                Instant::now(),
+            );
         }
         Some(overlap)
     }

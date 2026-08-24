@@ -12,7 +12,9 @@ use dynamo_kv_router::{
         KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError, LowerTierIndexers,
         ThreadPoolIndexer,
     },
-    protocols::{DpRank, RouterEvent, WorkerId},
+    protocols::{
+        DpRank, ExternalSequenceBlockHash, LocalBlockHash, RouterEvent, WorkerId, WorkerWithDpRank,
+    },
 };
 
 // Re-export tiered-match types so internal callers (`indexer::TieredMatchDetails`)
@@ -207,7 +209,7 @@ impl Indexer {
         }
     }
 
-    pub(crate) async fn apply_event(&self, event: RouterEvent) {
+    pub(crate) async fn apply_event(&self, event: RouterEvent) -> bool {
         match self {
             Self::KvIndexer {
                 primary,
@@ -215,24 +217,33 @@ impl Indexer {
                 ..
             } => match &event.event.data {
                 dynamo_kv_router::protocols::KvCacheEventData::Cleared => {
-                    if let Err(e) = primary.event_sender().send(event.clone()).await {
-                        tracing::warn!("Failed to send event to indexer: {e}");
-                    }
+                    let mut applied = match primary.event_sender().send(event.clone()).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(%error, "Failed to send event to indexer");
+                            false
+                        }
+                    };
 
                     for indexer in lower_tier.all() {
-                        indexer.apply_event(event.clone()).await;
+                        applied &= indexer.apply_event_checked(event.clone()).await;
                     }
+                    applied
                 }
                 _ if event.storage_tier.is_gpu() => {
-                    if let Err(e) = primary.event_sender().send(event).await {
-                        tracing::warn!("Failed to send event to indexer: {e}");
+                    match primary.event_sender().send(event).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(%error, "Failed to send event to indexer");
+                            false
+                        }
                     }
                 }
                 _ => {
                     lower_tier
                         .get_or_create(event.storage_tier)
-                        .apply_event(event)
-                        .await;
+                        .apply_event_checked(event)
+                        .await
                 }
             },
             Self::Concurrent {
@@ -241,24 +252,66 @@ impl Indexer {
                 ..
             } => match &event.event.data {
                 dynamo_kv_router::protocols::KvCacheEventData::Cleared => {
-                    primary.apply_event(event.clone()).await;
+                    let mut applied = primary.apply_event_checked(event.clone()).await;
 
                     for indexer in lower_tier.all() {
-                        indexer.apply_event(event.clone()).await;
+                        applied &= indexer.apply_event_checked(event.clone()).await;
                     }
+                    applied
                 }
-                _ if event.storage_tier.is_gpu() => {
-                    primary.apply_event(event).await;
-                }
+                _ if event.storage_tier.is_gpu() => primary.apply_event_checked(event).await,
                 _ => {
                     lower_tier
                         .get_or_create(event.storage_tier)
-                        .apply_event(event)
-                        .await;
+                        .apply_event_checked(event)
+                        .await
                 }
             },
-            Self::Remote { .. } | Self::None => {}
+            Self::Remote { .. } | Self::None => true,
         }
+    }
+
+    pub(crate) async fn flush_indexers_checked(&self) -> bool {
+        let (primary_applied, lower_tiers) = match self {
+            Self::KvIndexer {
+                primary,
+                lower_tier,
+                ..
+            } => {
+                KvIndexerInterface::flush(primary).await;
+                (true, lower_tier.all())
+            }
+            Self::Concurrent {
+                primary,
+                lower_tier,
+                ..
+            } => (primary.flush_checked().await, lower_tier.all()),
+            Self::Remote { .. } | Self::None => return true,
+        };
+        let mut applied = primary_applied;
+        for indexer in lower_tiers {
+            applied &= indexer.flush_checked().await;
+        }
+        applied
+    }
+
+    pub(crate) async fn resolve_lower_tier_local_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        storage_tier: dynamo_kv_router::protocols::StorageTier,
+        block_hashes: Vec<ExternalSequenceBlockHash>,
+    ) -> Option<Vec<LocalBlockHash>> {
+        if storage_tier.is_gpu() {
+            return None;
+        }
+        let lower_tier = match self {
+            Self::KvIndexer { lower_tier, .. } | Self::Concurrent { lower_tier, .. } => lower_tier,
+            Self::Remote { .. } | Self::None => return None,
+        };
+        lower_tier
+            .get(storage_tier)?
+            .resolve_local_hashes(worker, block_hashes)
+            .await
     }
 
     pub(crate) async fn remove_worker(&self, worker_id: WorkerId) {
