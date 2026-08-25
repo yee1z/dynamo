@@ -394,6 +394,15 @@ impl Node {
         })
     }
 
+    pub(super) fn local_hash_for_external(
+        &self,
+        block_hash: ExternalSequenceBlockHash,
+    ) -> Option<LocalBlockHash> {
+        let state = self.state.read();
+        let position = *state.edge_index.get(&block_hash)?;
+        state.edge.get(position).map(|(local_hash, _)| *local_hash)
+    }
+
     pub(super) fn plan_store_parent_edge(
         &self,
         parent_hash: ExternalSequenceBlockHash,

@@ -68,8 +68,22 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                         sweep_tree,
                     );
                 }
-                WorkerTask::ResolveLocalHashes { resp, .. } => {
-                    let _ = resp.send(None);
+                WorkerTask::ResolveLocalHashes {
+                    worker,
+                    block_hashes,
+                    resp,
+                } => {
+                    let resolved = lookup.get(&worker).and_then(|worker_lookup| {
+                        block_hashes
+                            .iter()
+                            .map(|block_hash| {
+                                worker_lookup
+                                    .get(block_hash)?
+                                    .local_hash_for_external(*block_hash)
+                            })
+                            .collect()
+                    });
+                    let _ = resp.send(resolved);
                 }
                 WorkerTask::CleanupStaleChildren => {
                     self.run_cleanup_task();

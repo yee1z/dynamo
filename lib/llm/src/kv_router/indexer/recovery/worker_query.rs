@@ -268,7 +268,7 @@ impl WorkerQueryClient {
             }
             KvCacheEventData::Removed(remove) if !remove.block_hashes.is_empty() => self
                 .indexer
-                .resolve_lower_tier_local_hashes(
+                .resolve_local_hashes(
                     WorkerWithDpRank::new(event.worker_id, event.event.dp_rank),
                     event.storage_tier,
                     remove.block_hashes.clone(),
@@ -1230,6 +1230,45 @@ mod tests {
             client.event_fence(&unknown_remove).await,
             LowerTierUpdateFence::WholeWorker
         );
+    }
+
+    #[tokio::test]
+    async fn gpu_remove_uses_primary_owner_key_fence() {
+        let (client, _transport, _indexer) = make_test_client("gpu-remove-fence").await;
+        let gpu_store = make_store_event(1, 0, 7);
+        assert!(client.indexer.apply_event(gpu_store).await);
+
+        let gpu_remove = RouterEvent::new(
+            1,
+            KvCacheEvent {
+                event_id: 8,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(7)],
+                }),
+                dp_rank: 0,
+            },
+        );
+        assert_eq!(
+            client.event_fence(&gpu_remove).await,
+            LowerTierUpdateFence::keys([LocalBlockHash(7)])
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_apply_ack_reports_radix_rejection() {
+        let (_primary, indexer) = make_test_indexer();
+        let rejected_remove = RouterEvent::new(
+            1,
+            KvCacheEvent {
+                event_id: 1,
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes: vec![ExternalSequenceBlockHash(999)],
+                }),
+                dp_rank: 0,
+            },
+        );
+
+        assert!(!indexer.apply_event(rejected_remove).await);
     }
 
     #[tokio::test]

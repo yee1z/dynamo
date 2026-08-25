@@ -217,28 +217,14 @@ impl Indexer {
                 ..
             } => match &event.event.data {
                 dynamo_kv_router::protocols::KvCacheEventData::Cleared => {
-                    let mut applied = match primary.event_sender().send(event.clone()).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            tracing::warn!(%error, "Failed to send event to indexer");
-                            false
-                        }
-                    };
+                    let mut applied = primary.apply_event_checked(event.clone()).await;
 
                     for indexer in lower_tier.all() {
                         applied &= indexer.apply_event_checked(event.clone()).await;
                     }
                     applied
                 }
-                _ if event.storage_tier.is_gpu() => {
-                    match primary.event_sender().send(event).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            tracing::warn!(%error, "Failed to send event to indexer");
-                            false
-                        }
-                    }
-                }
+                _ if event.storage_tier.is_gpu() => primary.apply_event_checked(event).await,
                 _ => {
                     lower_tier
                         .get_or_create(event.storage_tier)
@@ -295,14 +281,22 @@ impl Indexer {
         applied
     }
 
-    pub(crate) async fn resolve_lower_tier_local_hashes(
+    pub(crate) async fn resolve_local_hashes(
         &self,
         worker: WorkerWithDpRank,
         storage_tier: dynamo_kv_router::protocols::StorageTier,
         block_hashes: Vec<ExternalSequenceBlockHash>,
     ) -> Option<Vec<LocalBlockHash>> {
         if storage_tier.is_gpu() {
-            return None;
+            return match self {
+                Self::KvIndexer { primary, .. } => {
+                    primary.resolve_local_hashes(worker, block_hashes).await
+                }
+                Self::Concurrent { primary, .. } => {
+                    primary.resolve_local_hashes(worker, block_hashes).await
+                }
+                Self::Remote { .. } | Self::None => None,
+            };
         }
         let lower_tier = match self {
             Self::KvIndexer { lower_tier, .. } | Self::Concurrent { lower_tier, .. } => lower_tier,
@@ -529,6 +523,27 @@ mod tests {
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
             primary_records_routing_decisions: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_index_owners_resolve_external_hashes() {
+        let worker = WorkerWithDpRank::new(7, 0);
+        let external_hash =
+            ExternalSequenceBlockHash(compute_seq_hash_for_block(&[LocalBlockHash(11)])[0]);
+
+        for indexer in [make_test_indexer(), make_test_concurrent_indexer()] {
+            assert!(
+                indexer
+                    .apply_event(store_event(7, 0, 1, &[], &[11], StorageTier::Device))
+                    .await
+            );
+            assert_eq!(
+                indexer
+                    .resolve_local_hashes(worker, StorageTier::Device, vec![external_hash])
+                    .await,
+                Some(vec![LocalBlockHash(11)])
+            );
         }
     }
 

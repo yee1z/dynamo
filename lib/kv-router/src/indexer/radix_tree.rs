@@ -201,6 +201,25 @@ impl RadixTree {
         self.find_match_details(sequence, early_exit).overlap_scores
     }
 
+    pub fn resolve_local_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        block_hashes: &[ExternalSequenceBlockHash],
+    ) -> Option<Vec<LocalBlockHash>> {
+        let worker_lookup = self.lookup.get(&worker)?;
+        block_hashes
+            .iter()
+            .map(|block_hash| {
+                let node = worker_lookup.get(block_hash)?.borrow();
+                let position = *node.state.edge_index.get(block_hash)?;
+                node.state
+                    .edge
+                    .get(position)
+                    .map(|(local_hash, _)| *local_hash)
+            })
+            .collect()
+    }
+
     pub fn apply_event(&mut self, event: RouterEvent) -> Result<(), KvCacheEventError> {
         self.apply_event_with_counters(event, None)
     }

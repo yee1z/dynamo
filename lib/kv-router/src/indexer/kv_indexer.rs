@@ -23,7 +23,7 @@ fn apply_event_with_counters(
     trie: &mut RadixTree,
     event: RouterEvent,
     counters: &PreBoundEventCounters,
-) {
+) -> bool {
     let kind = EventKind::of(&event.event.data);
     let event_id = event.event.event_id;
     let worker_id = event.worker_id;
@@ -36,6 +36,18 @@ fn apply_event_with_counters(
         );
     }
     counters.inc(kind, result);
+    result_is_ok
+}
+
+struct CheckedEventRequest {
+    event: RouterEvent,
+    resp: oneshot::Sender<bool>,
+}
+
+struct ResolveLocalHashesRequest {
+    worker: WorkerWithDpRank,
+    block_hashes: Vec<ExternalSequenceBlockHash>,
+    resp: oneshot::Sender<Option<Vec<LocalBlockHash>>>,
 }
 
 fn apply_routing_decision_with_prune_tracking(
@@ -120,6 +132,8 @@ fn apply_prune_removes(trie: &mut RadixTree, entries: Vec<BlockEntry>, event_id_
 
 struct PendingMutationReceivers<'a> {
     event_rx: &'a mut mpsc::Receiver<RouterEvent>,
+    checked_event_rx: &'a mut mpsc::Receiver<CheckedEventRequest>,
+    resolve_local_hashes_rx: &'a mut mpsc::Receiver<ResolveLocalHashesRequest>,
     remove_worker_rx: &'a mut mpsc::Receiver<WorkerId>,
     remove_worker_dp_rank_rx: &'a mut mpsc::Receiver<(WorkerId, DpRank)>,
     routing_rx: &'a mut mpsc::Receiver<RoutingDecisionRequest>,
@@ -150,6 +164,16 @@ fn drain_pending_mutations(
         apply_event_with_counters(trie, event, counters);
     }
 
+    while let Ok(req) = receivers.checked_event_rx.try_recv() {
+        let applied = apply_event_with_counters(trie, req.event, counters);
+        let _ = req.resp.send(applied);
+    }
+
+    while let Ok(req) = receivers.resolve_local_hashes_rx.try_recv() {
+        let resolved = trie.resolve_local_hashes(req.worker, &req.block_hashes);
+        let _ = req.resp.send(resolved);
+    }
+
     while let Ok(routing_req) = receivers.routing_rx.try_recv() {
         apply_routing_decision_with_prune_tracking(
             trie,
@@ -172,6 +196,10 @@ pub struct KvIndexer {
     cancel: CancellationToken,
     /// A sender for `RouterEvent`s.
     event_tx: mpsc::Sender<RouterEvent>,
+    /// A sender for events whose callers need the apply result.
+    checked_event_tx: mpsc::Sender<CheckedEventRequest>,
+    /// A sender for lookups against the primary index owner's hash map.
+    resolve_local_hashes_tx: mpsc::Sender<ResolveLocalHashesRequest>,
     /// A sender for `MatchRequest`s.
     match_tx: mpsc::Sender<MatchRequest>,
     /// A sender for `MatchDetailsRequest`s.
@@ -215,6 +243,9 @@ impl KvIndexer {
         super::warn_on_unit_block_size("single", kv_block_size);
 
         let (event_tx, event_rx) = mpsc::channel::<RouterEvent>(16384);
+        let (checked_event_tx, checked_event_rx) = mpsc::channel::<CheckedEventRequest>(128);
+        let (resolve_local_hashes_tx, resolve_local_hashes_rx) =
+            mpsc::channel::<ResolveLocalHashesRequest>(128);
         let (match_tx, match_rx) = mpsc::channel::<MatchRequest>(128);
         let (match_details_tx, match_details_rx) = mpsc::channel::<MatchDetailsRequest>(128);
         let (remove_worker_tx, remove_worker_rx) = mpsc::channel::<WorkerId>(16);
@@ -239,6 +270,8 @@ impl KvIndexer {
                     let mut match_rx = match_rx;
                     let mut match_details_rx = match_details_rx;
                     let mut event_rx = event_rx;
+                    let mut checked_event_rx = checked_event_rx;
+                    let mut resolve_local_hashes_rx = resolve_local_hashes_rx;
                     let mut remove_worker_rx = remove_worker_rx;
                     let mut remove_worker_dp_rank_rx = remove_worker_dp_rank_rx;
                     let mut get_workers_rx = get_workers_rx;
@@ -278,6 +311,23 @@ impl KvIndexer {
                                 apply_event_with_counters(&mut trie, event, &counters);
                             }
 
+                            Some(req) = checked_event_rx.recv() => {
+                                let applied = apply_event_with_counters(
+                                    &mut trie,
+                                    req.event,
+                                    &counters,
+                                );
+                                let _ = req.resp.send(applied);
+                            }
+
+                            Some(req) = resolve_local_hashes_rx.recv() => {
+                                let resolved = trie.resolve_local_hashes(
+                                    req.worker,
+                                    &req.block_hashes,
+                                );
+                                let _ = req.resp.send(resolved);
+                            }
+
                             Some(get_workers_req) = get_workers_rx.recv() => {
                                 let workers = trie.get_workers();
                                 let _ = get_workers_req.resp.send(workers);
@@ -288,6 +338,8 @@ impl KvIndexer {
                                     &mut trie,
                                     PendingMutationReceivers {
                                         event_rx: &mut event_rx,
+                                        checked_event_rx: &mut checked_event_rx,
+                                        resolve_local_hashes_rx: &mut resolve_local_hashes_rx,
                                         remove_worker_rx: &mut remove_worker_rx,
                                         remove_worker_dp_rank_rx: &mut remove_worker_dp_rank_rx,
                                         routing_rx: &mut routing_rx,
@@ -305,6 +357,8 @@ impl KvIndexer {
                                     &mut trie,
                                     PendingMutationReceivers {
                                         event_rx: &mut event_rx,
+                                        checked_event_rx: &mut checked_event_rx,
+                                        resolve_local_hashes_rx: &mut resolve_local_hashes_rx,
                                         remove_worker_rx: &mut remove_worker_rx,
                                         remove_worker_dp_rank_rx: &mut remove_worker_dp_rank_rx,
                                         routing_rx: &mut routing_rx,
@@ -395,6 +449,8 @@ impl KvIndexer {
         Self {
             cancel: token,
             event_tx,
+            checked_event_tx,
+            resolve_local_hashes_tx,
             match_tx,
             match_details_tx,
             remove_worker_tx,
@@ -427,6 +483,38 @@ impl KvIndexer {
     /// A `mpsc::Sender` for `RouterEvent`s.
     pub fn event_sender(&self) -> mpsc::Sender<RouterEvent> {
         self.event_tx.clone()
+    }
+
+    /// Apply an event and report the result after the radix tree mutation.
+    pub async fn apply_event_checked(&self, event: RouterEvent) -> bool {
+        let (resp, result) = oneshot::channel();
+        if self
+            .checked_event_tx
+            .send(CheckedEventRequest { event, resp })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        result.await.unwrap_or(false)
+    }
+
+    /// Resolve opaque event hashes through the primary index owner's lookup.
+    pub async fn resolve_local_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        block_hashes: Vec<ExternalSequenceBlockHash>,
+    ) -> Option<Vec<LocalBlockHash>> {
+        let (resp, result) = oneshot::channel();
+        self.resolve_local_hashes_tx
+            .send(ResolveLocalHashesRequest {
+                worker,
+                block_hashes,
+                resp,
+            })
+            .await
+            .ok()?;
+        result.await.ok().flatten()
     }
 
     pub async fn find_match_details(
