@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use rmp_serde::Deserializer;
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -52,10 +54,17 @@ pub async fn start_simple_zmq_listener(
     tracker: SharedCacheStatusTracker,
     cancellation_token: CancellationToken,
     engine_source: EventSource,
+    event_ready: Arc<Notify>,
 ) -> Result<JoinHandle<()>> {
     let handle = tokio::spawn(async move {
-        if let Err(e) =
-            run_listener_loop(endpoint, tracker, cancellation_token, engine_source).await
+        if let Err(e) = run_listener_loop(
+            endpoint,
+            tracker,
+            cancellation_token,
+            engine_source,
+            event_ready,
+        )
+        .await
         {
             tracing::error!("ZMQ listener task failed: {}", e);
         }
@@ -69,6 +78,7 @@ async fn run_listener_loop(
     tracker: SharedCacheStatusTracker,
     cancellation_token: CancellationToken,
     engine_source: EventSource,
+    event_ready: Arc<Notify>,
 ) -> Result<()> {
     tracing::info!(
         "KV event consolidator ZMQ listener connecting to {}",
@@ -135,15 +145,32 @@ async fn run_listener_loop(
                 );
 
                 // Process events
-                let mut tracker_guard = tracker.write().await;
-                for event in batch.events() {
-                    process_event(&mut **tracker_guard, event.clone(), dp_rank, engine_source);
-                }
+                process_batch(&tracker, &event_ready, &batch, engine_source).await;
             }
         }
     }
 
     Ok(())
+}
+
+async fn process_batch(
+    tracker: &SharedCacheStatusTracker,
+    event_ready: &Notify,
+    batch: &VllmEventBatch,
+    engine_source: EventSource,
+) {
+    {
+        let mut tracker_guard = tracker.write().await;
+        for event in batch.events() {
+            process_event(
+                &mut **tracker_guard,
+                event.clone(),
+                batch.data_parallel_rank(),
+                engine_source,
+            );
+        }
+    }
+    event_ready.notify_one();
 }
 
 fn process_event(
@@ -252,5 +279,24 @@ fn process_event(
         }
 
         RawKvEvent::Ignored => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_manager::kv_consolidator::PassthroughCacheStatusTracker;
+
+    #[tokio::test]
+    async fn engine_batch_notifies_after_tracker_mutation() {
+        let tracker: Box<dyn CacheStatusTracker> = Box::new(PassthroughCacheStatusTracker::new());
+        let tracker = Arc::new(tokio::sync::RwLock::new(tracker));
+        let event_ready = Notify::new();
+        let batch = VllmEventBatch(0.0, vec![RawKvEvent::AllBlocksCleared], Some(0));
+
+        process_batch(&tracker, &event_ready, &batch, EventSource::Vllm).await;
+
+        event_ready.notified().await;
+        assert_eq!(tracker.write().await.drain_events().len(), 1);
     }
 }

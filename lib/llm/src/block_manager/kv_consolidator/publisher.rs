@@ -12,6 +12,7 @@ use rmp_serde::Serializer;
 use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::SharedCacheStatusTracker;
@@ -141,6 +142,14 @@ pub struct KvEventConsolidatorPublisher {
 impl KvEventConsolidatorPublisher {
     /// Create a new publisher
     pub fn new(endpoint: &str, tracker: SharedCacheStatusTracker) -> Result<Self> {
+        Self::new_with_trigger(endpoint, tracker, Arc::new(Notify::new()))
+    }
+
+    pub(crate) fn new_with_trigger(
+        endpoint: &str,
+        tracker: SharedCacheStatusTracker,
+        event_ready: Arc<Notify>,
+    ) -> Result<Self> {
         let endpoint = endpoint.to_string();
         let sequence = Arc::new(AtomicU64::new(0));
 
@@ -153,7 +162,8 @@ impl KvEventConsolidatorPublisher {
 
         // Start the publisher task
         let handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_publisher_loop(endpoint, tracker, sequence).await {
+            if let Err(e) = Self::run_publisher_loop(endpoint, tracker, sequence, event_ready).await
+            {
                 // Bind failures and other critical errors should crash the process
                 panic!("Publisher task failed: {}", e);
             }
@@ -181,6 +191,7 @@ impl KvEventConsolidatorPublisher {
         endpoint: String,
         tracker: SharedCacheStatusTracker,
         sequence: Arc<AtomicU64>,
+        event_ready: Arc<Notify>,
     ) -> Result<()> {
         tracing::info!("Starting consolidated event publisher on {}", endpoint);
 
@@ -195,7 +206,7 @@ impl KvEventConsolidatorPublisher {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
 
         loop {
-            interval.tick().await;
+            wait_for_publish_trigger(&mut interval, &event_ready).await;
 
             // Drain events from tracker
             let events = {
@@ -276,11 +287,46 @@ impl KvEventConsolidatorPublisher {
     }
 }
 
+async fn wait_for_publish_trigger(interval: &mut tokio::time::Interval, event_ready: &Notify) {
+    tokio::select! {
+        _ = event_ready.notified() => {}
+        _ = interval.tick() => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dynamo_kv_router::zmq_wire::{KvEventBatch, RawKvEvent};
     use rmp_serde as rmps;
+
+    #[tokio::test(start_paused = true)]
+    async fn event_ready_wakes_before_periodic_fallback() {
+        let event_ready = tokio::sync::Notify::new();
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
+        interval.tick().await;
+        let before = tokio::time::Instant::now();
+
+        event_ready.notify_one();
+        wait_for_publish_trigger(&mut interval, &event_ready).await;
+
+        assert_eq!(tokio::time::Instant::now(), before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_fallback_still_wakes_publisher() {
+        let event_ready = tokio::sync::Notify::new();
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
+        interval.tick().await;
+        let before = tokio::time::Instant::now();
+
+        wait_for_publish_trigger(&mut interval, &event_ready).await;
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(before),
+            tokio::time::Duration::from_millis(50)
+        );
+    }
 
     #[test]
     fn test_block_stored_with_medium_and_no_lora_name_decodes() {

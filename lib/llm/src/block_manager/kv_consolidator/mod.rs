@@ -19,7 +19,7 @@ pub use tracker::{
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,7 @@ pub type SharedCacheStatusTracker = Arc<RwLock<Box<dyn CacheStatusTracker>>>;
 #[derive(Clone, Debug)]
 pub struct KvEventConsolidatorHandle {
     pub(crate) tracker: SharedCacheStatusTracker,
+    event_ready: Arc<Notify>,
 }
 
 impl KvEventConsolidatorHandle {
@@ -50,17 +51,20 @@ impl KvEventConsolidatorHandle {
         tier: Option<StorageTier>,
         data_parallel_rank: Option<i32>,
     ) {
-        let mut tracker = self.tracker.write().await;
-        tracker.handle_store(StoreEventInput {
-            block_hash,
-            source,
-            token_ids,
-            parent_hash,
-            block_size,
-            lora_name,
-            tier,
-            data_parallel_rank,
-        });
+        {
+            let mut tracker = self.tracker.write().await;
+            tracker.handle_store(StoreEventInput {
+                block_hash,
+                source,
+                token_ids,
+                parent_hash,
+                block_size,
+                lora_name,
+                tier,
+                data_parallel_rank,
+            });
+        }
+        self.event_ready.notify_one();
     }
 
     /// Send a block remove event to the KV Event Consolidator
@@ -72,20 +76,26 @@ impl KvEventConsolidatorHandle {
         source: EventSource,
         tier: Option<StorageTier>,
     ) {
-        let mut tracker = self.tracker.write().await;
-        tracker.handle_remove(RemoveEventInput {
-            block_hash: block_hash.to_string(),
-            source,
-            tier,
-        });
+        {
+            let mut tracker = self.tracker.write().await;
+            tracker.handle_remove(RemoveEventInput {
+                block_hash: block_hash.to_string(),
+                source,
+                tier,
+            });
+        }
+        self.event_ready.notify_one();
     }
 
     /// Clear all blocks from the KV Event Consolidator
     ///
     /// This is called by KVBM when all blocks should be evicted.
     pub async fn handle_clear_all(&self) {
-        let mut tracker = self.tracker.write().await;
-        tracker.handle_clear_all();
+        {
+            let mut tracker = self.tracker.write().await;
+            tracker.handle_clear_all();
+        }
+        self.event_ready.notify_one();
     }
 }
 
@@ -96,6 +106,7 @@ pub struct KvEventConsolidator {
     subscriber_handle: Option<JoinHandle<()>>,
     cancellation_token: CancellationToken,
     publisher: Option<KvEventConsolidatorPublisher>,
+    event_ready: Arc<Notify>,
 }
 
 impl KvEventConsolidator {
@@ -106,6 +117,7 @@ impl KvEventConsolidator {
             KvEventConsolidationMode::Passthrough => Box::new(PassthroughCacheStatusTracker::new()),
         };
         let tracker = Arc::new(RwLock::new(tracker));
+        let event_ready = Arc::new(Notify::new());
         let cancellation_token = CancellationToken::new();
 
         Ok(Self {
@@ -114,6 +126,7 @@ impl KvEventConsolidator {
             subscriber_handle: None,
             cancellation_token,
             publisher: None,
+            event_ready,
         })
     }
 
@@ -127,9 +140,10 @@ impl KvEventConsolidator {
         );
 
         // Always publish to ZMQ (worker-side publishers will add worker_id and forward to NATS)
-        let publisher = KvEventConsolidatorPublisher::new(
+        let publisher = KvEventConsolidatorPublisher::new_with_trigger(
             &self.config.consolidated_event_endpoint,
             self.tracker.clone(),
+            self.event_ready.clone(),
         )?;
         self.publisher = Some(publisher);
         tracing::info!("Waiting for downstream ZMQ subscribers to connect...");
@@ -141,6 +155,7 @@ impl KvEventConsolidator {
             self.tracker.clone(),
             self.cancellation_token.clone(),
             self.config.engine_source,
+            self.event_ready.clone(),
         )
         .await?;
 
@@ -180,6 +195,41 @@ impl KvEventConsolidator {
     pub fn get_handle(&self) -> KvEventConsolidatorHandle {
         KvEventConsolidatorHandle {
             tracker: self.tracker.clone(),
+            event_ready: self.event_ready.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn kvbm_handle_coalesces_wakeups_and_retains_all_events() {
+        let tracker: Box<dyn CacheStatusTracker> = Box::new(PassthroughCacheStatusTracker::new());
+        let tracker = Arc::new(RwLock::new(tracker));
+        let event_ready = Arc::new(Notify::new());
+        let handle = KvEventConsolidatorHandle {
+            tracker: tracker.clone(),
+            event_ready: event_ready.clone(),
+        };
+
+        for hash in ["1", "2"] {
+            handle
+                .handle_store(
+                    hash.to_string(),
+                    EventSource::Kvbm,
+                    vec![1, 2, 3, 4],
+                    None,
+                    4,
+                    None,
+                    Some(StorageTier::HostPinned),
+                    Some(0),
+                )
+                .await;
+        }
+
+        event_ready.notified().await;
+        assert_eq!(tracker.write().await.drain_events().len(), 2);
     }
 }
