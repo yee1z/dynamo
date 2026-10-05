@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from vllm.v1.request import RequestStatus  # noqa: E402
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler  # noqa: E402
 
 # Module-level import: triggers real site-packages ``vllm`` to load before
 # pytest's rootpath insertion adds ``components/src/dynamo`` to ``sys.path``
@@ -30,6 +31,7 @@ from dynamo.vllm.instrumented_scheduler import (  # noqa: E402
     InstrumentedScheduler,
     _BenchPhase,
 )
+from dynamo.vllm import instrumented_scheduler as scheduler_module  # noqa: E402
 
 pytestmark = [
     pytest.mark.unit,
@@ -83,6 +85,51 @@ def _make_new_request(req_id: str, prompt_len: int, num_computed_tokens: int):
         prompt_token_ids=[0] * prompt_len,
         num_computed_tokens=num_computed_tokens,
     )
+
+
+def test_schedule_supports_parent_without_throttle_prefills(monkeypatch):
+    """vLLM 0.20.1 removed the positional throttle_prefills argument."""
+    output = SimpleNamespace(total_num_scheduled_tokens=0)
+    calls = []
+
+    def parent_schedule(self):
+        calls.append(self)
+        return output
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", parent_schedule)
+    monkeypatch.setattr(
+        scheduler_module, "_PARENT_SCHEDULE_HAS_THROTTLE_PREFILLS", False
+    )
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._schedule_times = []
+    stub._emit_m1_prefill_start = MagicMock()
+
+    result = InstrumentedScheduler._schedule_and_record_time(stub, True)
+
+    assert result is output
+    assert calls == [stub]
+
+
+def test_schedule_preserves_parent_throttle_prefills_when_supported(monkeypatch):
+    output = SimpleNamespace(total_num_scheduled_tokens=0)
+    calls = []
+
+    def parent_schedule(self, throttle_prefills=False):
+        calls.append((self, throttle_prefills))
+        return output
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", parent_schedule)
+    monkeypatch.setattr(
+        scheduler_module, "_PARENT_SCHEDULE_HAS_THROTTLE_PREFILLS", True
+    )
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._schedule_times = []
+    stub._emit_m1_prefill_start = MagicMock()
+
+    result = InstrumentedScheduler._schedule_and_record_time(stub, True)
+
+    assert result is output
+    assert calls == [(stub, True)]
 
 
 def _run_extract_scheduled(

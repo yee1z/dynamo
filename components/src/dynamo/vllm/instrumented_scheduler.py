@@ -78,6 +78,7 @@ Inject via:
 from __future__ import annotations
 
 import enum
+import inspect
 import json
 import logging
 import math
@@ -124,6 +125,9 @@ ENV_FPM_PORT = "DYN_FORWARDPASS_METRIC_PORT"
 ENV_FPM_WORKER_ID = "DYN_FPM_WORKER_ID"
 ENV_FPM_BENCHMARK_OUTPUT_PATH = "DYN_FPM_BENCHMARK_OUTPUT_PATH"
 ENV_M1_TRACE = "DYN_M1_TRACE"
+_PARENT_SCHEDULE_HAS_THROTTLE_PREFILLS = (
+    "throttle_prefills" in inspect.signature(AsyncScheduler.schedule).parameters
+)
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +426,10 @@ class InstrumentedScheduler(AsyncScheduler):
     def _schedule_and_record_time(
         self, throttle_prefills: bool = False
     ) -> SchedulerOutput:
-        output = super().schedule(throttle_prefills)
+        if _PARENT_SCHEDULE_HAS_THROTTLE_PREFILLS:
+            output = super().schedule(throttle_prefills)
+        else:
+            output = super().schedule()
         if output.total_num_scheduled_tokens > 0:
             self._schedule_times.append(time.monotonic())
             self._emit_m1_prefill_start(output)
