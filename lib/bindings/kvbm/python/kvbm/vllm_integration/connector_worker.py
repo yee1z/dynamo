@@ -245,3 +245,14 @@ class KvConnectorWorker:
         # finished_ids = [id for id in finished_req_ids]
         # return set(sending_ids), set(receiving_ids)
         return self._connector.get_finished(finished_req_ids)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """
+        Device block ids whose KV onboarding failed, each reported once.
+
+        vLLM calls this right after ``get_finished``; KVBM reports the blocks of a
+        failed load in the same pass in which ``get_finished`` returns the request,
+        as ``KVConnectorBase_V1`` requires. vLLM then fails or recomputes the
+        request according to ``kv_load_failure_policy``.
+        """
+        return set(self._connector.get_block_ids_with_load_errors())

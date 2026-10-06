@@ -33,6 +33,33 @@ struct PendingMessage {
     want_payload: bool,
     // Collected raw payloads (one per worker), if want_payload == true
     payloads: Option<Vec<Vec<u8>>>,
+    // If set, receives the collected payloads instead of `completion_indicator`, and the
+    // message is forgotten once every worker answered (see `broadcast_with_payloads`).
+    payload_indicator: Option<oneshot::Sender<Vec<Vec<u8>>>>,
+}
+
+impl PendingMessage {
+    fn with_payloads(num_workers: usize, payload_indicator: oneshot::Sender<Vec<Vec<u8>>>) -> Self {
+        Self {
+            remaining_workers: num_workers,
+            completion_indicator: None,
+            want_payload: true,
+            payloads: Some(Vec::with_capacity(num_workers)),
+            payload_indicator: Some(payload_indicator),
+        }
+    }
+
+    /// Record one worker's answer: `payload` is the first data frame of a reply, or `None` for a
+    /// bare ack. Returns true once every worker has answered.
+    fn record_reply(&mut self, payload: Option<&[u8]>) -> bool {
+        if self.want_payload
+            && let (Some(payload), Some(payloads)) = (payload, self.payloads.as_mut())
+        {
+            payloads.push(payload.to_vec());
+        }
+        self.remaining_workers = self.remaining_workers.saturating_sub(1);
+        self.remaining_workers == 0
+    }
 }
 
 pub struct LeaderSockets {
@@ -254,6 +281,7 @@ impl ZmqActiveMessageLeader {
             completion_indicator: Some(completion_indicator),
             want_payload: false,
             payloads: None,
+            payload_indicator: None,
         };
 
         // Add the message to the pending messages map.
@@ -283,6 +311,46 @@ impl ZmqActiveMessageLeader {
         Ok(completion_receiver)
     }
 
+    /// Broadcast a message and collect the first payload frame of each worker's reply.
+    /// The receiver yields the payloads once every worker has answered; a worker that only
+    /// acked contributes no payload, so callers can detect it.
+    pub async fn broadcast_with_payloads(
+        &self,
+        function: &str,
+        data: Vec<Vec<u8>>,
+    ) -> Result<oneshot::Receiver<Vec<Vec<u8>>>> {
+        let id = {
+            let mut id = self.message_id.lock().await;
+            *id += 1;
+            *id
+        };
+
+        let (payload_indicator, payload_receiver) = oneshot::channel();
+        self.pending_messages.lock().await.insert(
+            id,
+            PendingMessage::with_payloads(*self.num_workers, payload_indicator),
+        );
+
+        // id, function, data
+        let mut message: VecDeque<Message> = VecDeque::with_capacity(data.len() + 2);
+        message.push_back(id.to_be_bytes().as_slice().into());
+        message.push_back(function.into());
+        for data in data {
+            message.push_back(data.into());
+        }
+
+        tracing::debug!(
+            "ZmqActiveMessageLeader: Broadcasting message with id {} (collecting replies)",
+            id
+        );
+        if let Err(error) = self.pub_socket.lock().await.send(Multipart(message)).await {
+            self.pending_messages.lock().await.remove(&id);
+            return Err(error.into());
+        }
+
+        Ok(payload_receiver)
+    }
+
     /// Generic broadcast that can collect one reply payload from each worker.
     /// - `function`: handler name on workers
     /// - `data_frames`: optional extra frames after [id, function]
@@ -308,6 +376,7 @@ impl ZmqActiveMessageLeader {
             completion_indicator: Some(completion_indicator),
             want_payload,
             payloads: want_payload.then(|| Vec::with_capacity(*self.num_workers)),
+            payload_indicator: None,
         };
         self.pending_messages
             .lock()
@@ -362,31 +431,32 @@ impl ZmqActiveMessageLeader {
 
                 let mut map = pending_messages.lock().await;
 
-                if let Some(pm) = map.get_mut(&id) {
-                    // payload reply or pure ACK?
-                    if message.len() == 1 {
-                        if pm.remaining_workers > 0 { pm.remaining_workers -= 1; }
-                    } else {
-                        if pm.want_payload && message.len() >= 3
-                            && let Some(bufs) = pm.payloads.as_mut() {
-                                bufs.push((*message[2]).to_vec());
-                            }
-                        if pm.remaining_workers > 0 { pm.remaining_workers -= 1; }
-                    }
-
-                    tracing::debug!(
-                        "Leader PULL: got {} for id {} (remaining={})",
-                        if message.len()==1 { "ACK" } else { "REPLY" }, id, pm.remaining_workers
-                    );
-
-                    // IMPORTANT: do NOT remove here; just notify completion.
-                    if pm.remaining_workers == 0
-                        && let Some(tx) = pm.completion_indicator.take() {
-                            let _ = tx.send(());
-                        }
-                } else {
+                let Some(pm) = map.get_mut(&id) else {
                     // Late reply for a round we've already collected/removed.
                     tracing::debug!("Leader PULL: late/unknown id {}", id);
+                    continue;
+                };
+
+                // payload reply or pure ACK?
+                let payload = (message.len() >= 3).then(|| &*message[2]);
+                let complete = pm.record_reply(payload);
+
+                tracing::debug!(
+                    "Leader PULL: got {} for id {} (remaining={})",
+                    if message.len()==1 { "ACK" } else { "REPLY" }, id, pm.remaining_workers
+                );
+
+                if !complete {
+                    continue;
+                }
+                if let Some(tx) = pm.payload_indicator.take() {
+                    // Payload collectors are done with the message once every worker answered.
+                    let payloads = pm.payloads.take().unwrap_or_default();
+                    map.remove(&id);
+                    let _ = tx.send(payloads);
+                } else if let Some(tx) = pm.completion_indicator.take() {
+                    // IMPORTANT: do NOT remove here; just notify completion.
+                    let _ = tx.send(());
                 }
             }
                 _ = cancel_token.cancelled() => {
@@ -591,5 +661,90 @@ impl ZmqActiveMessageWorker {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_message_collects_one_payload_per_worker() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = PendingMessage::with_payloads(2, tx);
+        assert!(!pending.record_reply(Some(b"first")));
+        assert!(pending.record_reply(Some(b"second")));
+        assert_eq!(
+            pending.payloads.as_deref(),
+            Some(&[b"first".to_vec(), b"second".to_vec()][..])
+        );
+    }
+
+    #[test]
+    fn bare_acks_complete_without_payloads() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = PendingMessage::with_payloads(2, tx);
+        assert!(!pending.record_reply(None));
+        assert!(pending.record_reply(Some(b"only")));
+        assert_eq!(pending.payloads.as_deref(), Some(&[b"only".to_vec()][..]));
+    }
+
+    #[test]
+    fn payloads_are_ignored_when_not_wanted() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = PendingMessage {
+            remaining_workers: 1,
+            completion_indicator: Some(tx),
+            want_payload: false,
+            payloads: None,
+            payload_indicator: None,
+        };
+        assert!(pending.record_reply(Some(b"ignored")));
+        assert!(pending.payloads.is_none());
+        // Extra replies never underflow the counter.
+        assert!(pending.record_reply(None));
+    }
+
+    #[tokio::test]
+    async fn pull_worker_delivers_reply_payloads_and_forgets_the_message() {
+        let context = Context::new();
+        let pull_socket = pull(&context).bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = pull_socket
+            .get_socket()
+            .get_last_endpoint()
+            .unwrap()
+            .unwrap();
+        let mut push_socket = push(&context).connect(&endpoint).unwrap();
+
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(7usize, PendingMessage::with_payloads(2, tx));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(ZmqActiveMessageLeader::pull_worker(
+            pull_socket,
+            pending.clone(),
+            cancel.clone(),
+        ));
+
+        for payload in [&b"one"[..], &b"two"[..]] {
+            let mut frames: VecDeque<Message> = VecDeque::new();
+            frames.push_back(7usize.to_be_bytes().as_slice().into());
+            frames.push_back("transfer_blocks".into());
+            frames.push_back(payload.into());
+            push_socket.send(Multipart(frames)).await.unwrap();
+        }
+
+        let payloads = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("payloads were not delivered")
+            .unwrap();
+        assert_eq!(payloads, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert!(!pending.lock().await.contains_key(&7));
+
+        cancel.cancel();
+        worker.await.unwrap().unwrap();
     }
 }

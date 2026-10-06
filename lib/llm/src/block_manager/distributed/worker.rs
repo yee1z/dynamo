@@ -3,6 +3,9 @@
 
 use super::*;
 
+use super::staged::{
+    DISK_BOUNCE_BLOCKS_ENV, DISK_BOUNCE_FAIL_READS_ENV, DISK_BOUNCE_SLOTS_ENV, DiskBounceConfig,
+};
 use super::zmq::*;
 use async_trait::async_trait;
 use transfer::*;
@@ -150,7 +153,13 @@ async fn perform_allocation_and_build_handler(
 
     // Only create NIXL agent if we need disk blocks AND we should allocate
     let need_disk = should_allocate_offload && leader_meta.num_disk_blocks > 0;
-    let agent = build_agent(worker_id, disk_gds_enabled(need_disk)?)?;
+    let disk_gds = disk_gds_enabled(need_disk)?;
+    // Without GDS the POSIX backend cannot write device memory: stage disk onboarding through
+    // a pinned bounce buffer (configuration errors stop the worker instead of failing reads).
+    let disk_bounce_config = (need_disk && !disk_gds)
+        .then(DiskBounceConfig::from_env)
+        .transpose()?;
+    let agent = build_agent(worker_id, disk_gds)?;
     let pool_config = PoolConfig {
         enable_pool: true,
         max_concurrent_transfers: max_concurrent_transfers(),
@@ -218,7 +227,29 @@ async fn perform_allocation_and_build_handler(
         None
     };
 
-    let handler = BlockTransferHandler::new(
+    // disk bounce buffer - same block layout as the host pool, but never part of it, so G2
+    // contents and eviction are not affected by staged disk onboarding
+    let disk_bounce = match disk_bounce_config {
+        Some(config) => {
+            let bounce_layout = layout_builder
+                .num_blocks(config.total_blocks())
+                .build()?
+                .allocate_layout(
+                    worker_config.host_layout_type,
+                    Arc::new(PinnedAllocator::default()),
+                )?;
+            let bounce_blocks = KvbmWorker::make_layout::<_, BasicMetadata>(
+                bounce_layout,
+                transfer_context.nixl_agent().as_ref(),
+                3,
+                worker_id,
+            )?;
+            Some((config, bounce_blocks))
+        }
+        None => None,
+    };
+
+    let mut handler = BlockTransferHandler::new(
         device_blocks,
         host_blocks,
         disk_blocks,
@@ -226,6 +257,23 @@ async fn perform_allocation_and_build_handler(
         scheduler_client,
         worker_config.nccl_config,
     )?;
+    if let Some((config, bounce_blocks)) = disk_bounce {
+        handler = handler.with_disk_bounce(config, bounce_blocks)?;
+        tracing::info!(
+            segment_blocks = config.segment_blocks,
+            slots = config.slots,
+            "GDS disabled: disk onboarding is staged through a pinned bounce buffer \
+             ({DISK_BOUNCE_BLOCKS_ENV}, {DISK_BOUNCE_SLOTS_ENV})"
+        );
+        if config.inject_read_failures > 0 {
+            tracing::warn!(
+                "{DISK_BOUNCE_FAIL_READS_ENV}={}: the first {} staged disk reads will be \
+                 reported as failed (fault injection; validation runs only)",
+                config.inject_read_failures,
+                config.inject_read_failures
+            );
+        }
+    }
     Ok(handler)
 }
 

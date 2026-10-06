@@ -3,6 +3,10 @@
 
 use super::*;
 
+use super::staged::{
+    DISK_BOUNCE_FAIL_READS_ENV, DiskBounce, DiskBounceConfig, Segment, SegmentIo, StagedEvent,
+    plan_segments, run_staged,
+};
 use super::zmq::*;
 use futures::future::try_join_all;
 use nixl_sys::NixlDescriptor;
@@ -16,8 +20,9 @@ use crate::block_manager::{
         Block, BlockDataProvider, BlockDataProviderMut, ReadableBlock, WritableBlock,
         data::local::LocalBlockData,
         locality,
-        transfer::{TransferContext, WriteTo, WriteToStrategy},
+        transfer::{TransferContext, WriteTo, WriteToStrategy, read_disk_blocks_into_host},
     },
+    connector::protocol::TransferBlocksFailed,
     connector::scheduler::{SchedulingDecision, TransferSchedulerClient},
     offload::max_transfer_batch_size,
     storage::{DeviceStorage, DiskStorage, Local, PinnedStorage},
@@ -75,6 +80,58 @@ fn emit_transfer_boundary(
             "status": status,
         })
     );
+}
+
+/// Identity of an onboarding transfer for the per-segment trace events of the staged path.
+struct TransferTrace {
+    request_id: String,
+    request_key: u64,
+    transfer_id: String,
+    transfer_key: u64,
+    direction: &'static str,
+    tier_code: u64,
+    bytes_per_block: u64,
+}
+
+impl TransferTrace {
+    /// `disk_read_start/end` and `bounce_copy_start/end` of one segment (trace mode only); the
+    /// end events carry the segment's real status.
+    fn emit_segment(
+        &self,
+        event: StagedEvent,
+        segment: &Segment,
+        segments: usize,
+        slot: usize,
+        ok: Option<bool>,
+    ) {
+        if !m1_trace_enabled() {
+            return;
+        }
+        let blocks = segment.blocks.len() as u64;
+        tracing::info!(
+            "DYN_M1_TRACE {}",
+            serde_json::json!({
+                "schema": 1,
+                "ts_ns": nvtx::monotonic_ns(),
+                "request_id": self.request_id,
+                "request_key": self.request_key,
+                "request_key_hex": nvtx::key_hex(self.request_key),
+                "transfer_id": self.transfer_id,
+                "transfer_key": self.transfer_key,
+                "transfer_key_hex": nvtx::key_hex(self.transfer_key),
+                "component": "physical",
+                "event": event.name(),
+                "direction": self.direction,
+                "tier_code": self.tier_code,
+                "blocks": blocks,
+                "bytes": blocks.saturating_mul(self.bytes_per_block),
+                "status": ok.map(|ok| if ok { "ok" } else { "error" }),
+                "segment": segment.index,
+                "segments": segments,
+                "slot": slot,
+            })
+        );
+    }
 }
 
 #[cfg(feature = "nccl")]
@@ -292,6 +349,8 @@ pub struct BlockTransferHandler {
     context: Arc<TransferContext>,
     scheduler_client: Option<TransferSchedulerClient>,
     batcher: ConnectorTransferBatcher,
+    /// Pinned bounce buffer for Disk -> Device onboarding without the GDS backend.
+    disk_bounce: Option<Arc<DiskBounce>>,
     /// Transfer mode: sharded (default) or replicated
     transfer_mode: TransferMode,
     /// NCCL config (required for replicated mode)
@@ -321,10 +380,23 @@ impl BlockTransferHandler {
             context,
             scheduler_client,
             batcher: ConnectorTransferBatcher::new(),
+            disk_bounce: None,
             transfer_mode,
             #[cfg(feature = "nccl")]
             nccl_config,
         })
+    }
+
+    /// Stage Disk -> Device onboarding through `blocks`, a pinned bounce buffer of
+    /// `config.slots` x `config.segment_blocks` blocks registered with the NIXL agent.
+    pub(crate) fn with_disk_bounce(
+        mut self,
+        config: DiskBounceConfig,
+        blocks: Vec<LocalBlock<PinnedStorage, BasicMetadata>>,
+    ) -> Result<Self> {
+        let blocks = Self::get_local_data(Some(blocks)).unwrap_or_default();
+        self.disk_bounce = Some(Arc::new(DiskBounce::new(config, blocks)?));
+        Ok(self)
     }
 
     /// Returns the transfer mode (sharded or replicated)
@@ -399,7 +471,63 @@ impl BlockTransferHandler {
 
     /// Execute transfer with batching to prevent resource exhaustion
     pub async fn execute_transfer(&self, request: BlockTransferRequest) -> Result<()> {
+        self.execute_transfer_traced(request, None).await
+    }
+
+    async fn execute_transfer_traced(
+        &self,
+        request: BlockTransferRequest,
+        trace: Option<&TransferTrace>,
+    ) -> Result<()> {
+        // Staged onboarding segments the transfer itself, so it bypasses the batcher. In
+        // replicated mode it runs on rank 0 inside the replicated path (before the broadcast).
+        if self.transfer_mode == TransferMode::Sharded
+            && let Some(bounce) = self.staged_bounce(&request)
+        {
+            return self
+                .execute_staged_disk_to_device(bounce, &request, trace)
+                .await;
+        }
         self.batcher.execute_batched_transfer(self, request).await
+    }
+
+    /// The bounce buffer, when `request` is a Disk -> Device transfer that must be staged.
+    fn staged_bounce(&self, request: &BlockTransferRequest) -> Option<&Arc<DiskBounce>> {
+        match (request.from_pool(), request.to_pool()) {
+            (Disk, Device) => self.disk_bounce.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Disk -> Device through the pinned bounce buffer (see [`super::staged`]). Returns after
+    /// every started segment has finished, so a failure leaves no read or copy in flight.
+    async fn execute_staged_disk_to_device(
+        &self,
+        bounce: &Arc<DiskBounce>,
+        request: &BlockTransferRequest,
+        trace: Option<&TransferTrace>,
+    ) -> Result<()> {
+        let segments = plan_segments(request.blocks(), bounce.config().segment_blocks);
+        tracing::debug!(
+            "staged disk onboarding of {} blocks in {} segments",
+            request.blocks().len(),
+            segments.len()
+        );
+        let io = StagedSegmentIo {
+            handler: self,
+            bounce: bounce.as_ref(),
+        };
+        run_staged(
+            &io,
+            bounce.slots(),
+            &segments,
+            |event, segment, slot, ok| {
+                if let Some(trace) = trace {
+                    trace.emit_segment(event, segment, segments.len(), slot, ok);
+                }
+            },
+        )
+        .await
     }
 
     /// Execute transfer directly without batching (used by the batcher)
@@ -483,7 +611,10 @@ impl BlockTransferHandler {
         }
 
         // Rank 0 does the actual copy
-        if is_rank0 {
+        if is_rank0 && let Some(bounce) = self.staged_bounce(&request) {
+            self.execute_staged_disk_to_device(bounce, &request, None)
+                .await?;
+        } else if is_rank0 {
             let notify = match (request.from_pool(), request.to_pool()) {
                 (Device, Host) => {
                     self.begin_transfer(&self.device, &self.host, request.clone())
@@ -573,6 +704,62 @@ impl BlockTransferHandler {
             dst_indices.len()
         );
 
+        Ok(())
+    }
+}
+
+/// The two hops of a staged segment on this worker's pools.
+struct StagedSegmentIo<'a> {
+    handler: &'a BlockTransferHandler,
+    bounce: &'a DiskBounce,
+}
+
+fn pool_blocks<S: Storage>(
+    pool: &Option<LocalBlockDataList<S>>,
+    name: &str,
+    indices: impl Iterator<Item = usize>,
+) -> Result<LocalBlockDataList<S>> {
+    let pool = pool
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{name} pool not initialized"))?;
+    indices
+        .map(|idx| {
+            pool.get(idx)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{name} block {idx} out of range"))
+        })
+        .collect()
+}
+
+#[async_trait]
+impl SegmentIo for StagedSegmentIo<'_> {
+    async fn read_into_slot(&self, slot: usize, segment: &Segment) -> Result<()> {
+        let sources = pool_blocks(
+            &self.handler.disk,
+            "disk",
+            segment.blocks.iter().map(|(src, _)| *src),
+        )?;
+        let mut targets = self.bounce.slot_blocks(slot, segment.blocks.len())?;
+        read_disk_blocks_into_host(&sources, &mut targets, &self.handler.context)?
+            .await
+            .map_err(|_| anyhow::anyhow!("NIXL disk read ended without a result"))??;
+        if self.bounce.take_injected_read_failure() {
+            anyhow::bail!("injected disk read failure ({DISK_BOUNCE_FAIL_READS_ENV})");
+        }
+        Ok(())
+    }
+
+    async fn copy_from_slot(&self, slot: usize, segment: &Segment) -> Result<()> {
+        let sources = self.bounce.slot_blocks(slot, segment.blocks.len())?;
+        let mut targets = pool_blocks(
+            &self.handler.device,
+            "device",
+            segment.blocks.iter().map(|(_, dst)| *dst),
+        )?;
+        sources
+            .write_to(&mut targets, self.handler.context.clone())?
+            .await
+            .map_err(|_| anyhow::anyhow!("host -> device copy ended without completing"))?;
         Ok(())
     }
 }
@@ -683,9 +870,10 @@ impl Handler for BlockTransferHandler {
                     payload,
                 )
             });
-            // Disk onboarding is a fused direct-storage-to-device operation in
-            // this path. Keep a disk_read range aligned with the d2d range so
-            // the source tier remains directly queryable in Nsight Systems.
+            // Keep a disk_read range aligned with the d2d range so the source tier remains
+            // directly queryable in Nsight Systems. With GDS the read is fused with the copy;
+            // when staged through the bounce buffer this range spans both hops, and the
+            // per-segment M1 trace events separate the disk read from the host -> device copy.
             let disk_read_range = (is_onboard && *request.from_pool() == Disk).then(|| {
                 PhaseCRange::start("disk_read", CATEGORY_TRANSFER, payload)
             });
@@ -703,7 +891,29 @@ impl Handler for BlockTransferHandler {
                     None,
                 );
             }
-            let transfer_result = self.execute_transfer(request).await;
+            // Device blocks that receive KV data; reported to vLLM if the onboarding fails.
+            let onboard_block_ids: Vec<usize> = if is_onboard {
+                request.blocks().iter().map(|(_, dst)| *dst).collect()
+            } else {
+                Vec::new()
+            };
+            let segment_trace = (is_onboard && m1_trace_enabled()).then(|| TransferTrace {
+                request_id: trace_request_id.clone(),
+                request_key,
+                transfer_id: transfer_id.clone(),
+                transfer_key,
+                direction,
+                tier_code,
+                bytes_per_block: self
+                    .disk_bounce
+                    .as_ref()
+                    .map_or(PHASE_C_BLOCK_BYTES, |bounce| {
+                        bounce.bytes_per_block() as u64
+                    }),
+            });
+            let transfer_result = self
+                .execute_transfer_traced(request, segment_trace.as_ref())
+                .await;
             drop(disk_read_range);
             drop(dma_range);
             if is_onboard {
@@ -727,7 +937,15 @@ impl Handler for BlockTransferHandler {
                     Ok(())
                 }
                 Err(e) => {
-                    handle.mark_complete(Err(anyhow::anyhow!("{}", e))).await;
+                    let completion_error = if is_onboard {
+                        anyhow::Error::new(TransferBlocksFailed {
+                            block_ids: onboard_block_ids,
+                            reason: format!("{e:#}"),
+                        })
+                    } else {
+                        anyhow::anyhow!("{e:#}")
+                    };
+                    handle.mark_complete(Err(completion_error)).await;
                     Err(e)
                 }
             }
@@ -735,10 +953,92 @@ impl Handler for BlockTransferHandler {
             self.execute_transfer(request).await
         };
 
-        // we always ack regardless of if we error or not
-        message.ack().await?;
+        finish_transfer_message(&mut message, result).await
+    }
+}
 
-        // the error may trigger a cancellation
-        result
+/// Answer a transfer message with the transfer's result rather than a bare ack, so the leader
+/// can tell a failed transfer from a completed one. A failed transfer is logged, not returned:
+/// an error from a message handler cancels the whole ZMQ worker loop (critical task), after
+/// which every later transfer of the worker would hang.
+async fn finish_transfer_message(message: &mut MessageHandle, result: Result<()>) -> Result<()> {
+    let outcome = TransferOutcome::from_result(&result);
+    message
+        .reply(ZMQ_TRANSFER_BLOCKS_MESSAGE, &[outcome.encode()])
+        .await?;
+    if let Err(error) = result {
+        tracing::error!("block transfer failed; reported to the leader: {error:#}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::time::Duration;
+    use tmq::{AsZmqSocket, Context, Message, Multipart, publish, pull};
+    use tokio_util::sync::CancellationToken;
+
+    /// Stands in for a transfer handler whose transfers all fail.
+    struct FailingTransfers;
+
+    #[async_trait]
+    impl Handler for FailingTransfers {
+        async fn handle(&self, mut message: MessageHandle) -> Result<()> {
+            let result = Err(anyhow::anyhow!("disk read failed"));
+            finish_transfer_message(&mut message, result).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_transfers_are_reported_and_the_worker_keeps_serving() {
+        let context = Context::new();
+        let mut publisher = publish(&context).bind("tcp://127.0.0.1:*").unwrap();
+        let pub_url = publisher.get_socket().get_last_endpoint().unwrap().unwrap();
+        let mut replies = pull(&context).bind("tcp://127.0.0.1:*").unwrap();
+        let ack_url = replies.get_socket().get_last_endpoint().unwrap().unwrap();
+
+        let mut handlers: HashMap<String, Arc<dyn Handler>> = HashMap::new();
+        handlers.insert(
+            ZMQ_TRANSFER_BLOCKS_MESSAGE.to_string(),
+            Arc::new(FailingTransfers),
+        );
+        let cancel = CancellationToken::new();
+        let _worker =
+            ZmqActiveMessageWorker::new(&pub_url, &ack_url, handlers, cancel.clone()).unwrap();
+
+        // Publish until two different messages were answered (early messages can be lost while
+        // the subscriber connects). With a dying handler loop only the first would be answered.
+        let mut answered = HashSet::new();
+        let mut next_id = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while answered.len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker stopped answering after {} failed transfers",
+                answered.len()
+            );
+            next_id += 1;
+            let mut frames: VecDeque<Message> = VecDeque::new();
+            frames.push_back(next_id.to_be_bytes().as_slice().into());
+            frames.push_back(ZMQ_TRANSFER_BLOCKS_MESSAGE.into());
+            frames.push_back(b"{}".as_slice().into());
+            publisher.send(Multipart(frames)).await.unwrap();
+
+            if let Ok(Some(Ok(reply))) =
+                tokio::time::timeout(Duration::from_millis(100), replies.next()).await
+            {
+                assert_eq!(reply.len(), 3, "a transfer reply carries its result");
+                let id = usize::from_be_bytes((*reply[0]).try_into().unwrap());
+                let outcome: TransferOutcome = serde_json::from_slice(&reply[2]).unwrap();
+                assert!(!outcome.ok);
+                assert!(outcome.error.unwrap().contains("disk read failed"));
+                answered.insert(id);
+            }
+        }
+        assert!(!cancel.is_cancelled());
+        cancel.cancel();
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod staged;
 mod transfer;
 mod utils;
 mod zmq;
@@ -10,12 +11,13 @@ mod leader;
 mod nccl_bootstrap;
 mod worker;
 
-pub use leader::{KvbmLeader, KvbmLeaderConfig, KvbmLeaderNumBlocksConfig};
+pub use leader::{KvbmLeader, KvbmLeaderConfig, KvbmLeaderNumBlocksConfig, TransferCompletion};
 #[cfg(feature = "nccl")]
 pub use nccl_bootstrap::{NcclBootstrap, NcclCommOwned};
 pub use transfer::{BlockTransferHandler, NcclConfig};
 pub use utils::{
     BlockTransferPool, BlockTransferRequest, ConnectorRequestLeader, ConnectorTransferType,
+    TransferOutcome,
 };
 pub use worker::{KvbmWorker, KvbmWorkerConfig};
 pub use zmq::Handler;

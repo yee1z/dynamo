@@ -224,6 +224,15 @@ pub struct ImmediateTransferResult {
     pub status: anyhow::Result<()>,
 }
 
+/// Error of a failed onboarding transfer. It names the device blocks that did not receive their
+/// KV data so the worker connector can report them to vLLM (`get_block_ids_with_load_errors`).
+#[derive(Debug, thiserror::Error)]
+#[error("transfer into {} device blocks failed: {reason}", block_ids.len())]
+pub struct TransferBlocksFailed {
+    pub block_ids: Vec<usize>,
+    pub reason: String,
+}
+
 pub struct ImmediateTransferCompletionHandle {
     request_id: String,
     uuid: uuid::Uuid,

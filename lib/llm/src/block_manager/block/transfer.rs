@@ -24,6 +24,7 @@ use tokio::sync::oneshot;
 pub use crate::block_manager::storage::{CudaAccessible, Local, Remote};
 pub use async_trait::async_trait;
 pub use context::{PoolConfig, TransferContext};
+pub use nixl::read_disk_blocks_into_host;
 
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclGroup, bcast_block, bcast_layer};

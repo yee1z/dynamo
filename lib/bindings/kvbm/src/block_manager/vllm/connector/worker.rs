@@ -51,6 +51,12 @@ pub trait Worker: Send + Sync {
         &mut self,
         finished_requests: HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>);
+
+    /// Device block ids whose onboarding failed, each reported once. vLLM calls this right after
+    /// `get_finished`; ids appear no later than the pass that reports the request as finished.
+    fn get_block_ids_with_load_errors(&mut self) -> HashSet<usize> {
+        HashSet::new()
+    }
 }
 
 pub struct KvConnectorWorker {
@@ -69,6 +75,9 @@ pub struct KvConnectorWorker {
 
     /// For now, offloading operations will be enqueued at the end of the forward pass
     offloading_operations: Vec<WorkerTransferRequest>,
+
+    /// Device block ids of failed onboarding operations not yet reported to vLLM
+    load_error_block_ids: HashSet<usize>,
 
     bound: bool,
     iteration: u64,
@@ -109,6 +118,7 @@ impl KvConnectorWorker {
             maybe_finished_onboarding: HashSet::new(),
             maybe_finished_offloading: HashSet::new(),
             offloading_operations: Vec::new(),
+            load_error_block_ids: HashSet::new(),
             bound: false,
             iteration: 0,
             layers_complete: 0,
@@ -459,15 +469,29 @@ impl Worker for KvConnectorWorker {
             }
         }
 
-        // remove the finished requests from the maybe finished set
+        // remove the finished requests from the maybe finished set; failed onboarding blocks are
+        // collected first so vLLM learns about them in this same pass
         for request_id in &is_finished_onboarding {
             self.maybe_finished_onboarding.remove(request_id);
             if self.connector.has_slot(request_id) {
+                let failed = self.connector.take_failed_block_ids(request_id);
+                if !failed.is_empty() {
+                    tracing::error!(
+                        request_id,
+                        failed_blocks = failed.len(),
+                        "KV onboarding failed; reporting the device blocks to vLLM as load errors"
+                    );
+                    self.load_error_block_ids.extend(failed);
+                }
                 self.connector.remove_slot(request_id);
             }
         }
 
         (is_finished_offloading, is_finished_onboarding)
+    }
+
+    fn get_block_ids_with_load_errors(&mut self) -> HashSet<usize> {
+        std::mem::take(&mut self.load_error_block_ids)
     }
 }
 
@@ -556,6 +580,10 @@ impl PyKvConnectorWorker {
         finished_requests: HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>) {
         self.connector_worker.get_finished(finished_requests)
+    }
+
+    pub fn get_block_ids_with_load_errors(&mut self) -> HashSet<usize> {
+        self.connector_worker.get_block_ids_with_load_errors()
     }
 }
 

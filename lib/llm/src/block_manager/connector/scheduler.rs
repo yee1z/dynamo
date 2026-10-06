@@ -145,10 +145,14 @@ impl WorkerSchedulerClient {
     }
 }
 
+/// Device block ids of failed onboarding operations, shared by a worker slot and its scheduler slot.
+pub type FailedBlockIds = Arc<std::sync::Mutex<Vec<usize>>>;
+
 #[derive(Debug, Default)]
 pub struct WorkerSchedulerClientSlot {
     operations: Vec<uuid::Uuid>,
     completed: Arc<AtomicU64>,
+    failed_block_ids: FailedBlockIds,
 }
 
 impl WorkerSchedulerClientSlot {
@@ -156,6 +160,7 @@ impl WorkerSchedulerClientSlot {
         Self {
             operations: Vec::new(),
             completed: Arc::new(AtomicU64::new(0)),
+            failed_block_ids: FailedBlockIds::default(),
         }
     }
 
@@ -168,11 +173,14 @@ impl WorkerSchedulerClientSlot {
             request_id,
             completed: self.completed.clone(),
             expected_immediate_ops,
+            failed_block_ids: self.failed_block_ids.clone(),
         }
     }
 
     pub fn is_complete(&self) -> bool {
-        self.completed.load(Ordering::Relaxed) == self.operations.len() as u64
+        // Acquire pairs with the scheduler's Release increment, which follows the recording of
+        // any failed block ids for the operation.
+        self.completed.load(Ordering::Acquire) == self.operations.len() as u64
     }
 }
 
@@ -250,6 +258,20 @@ impl WorkerSchedulerClient {
         }
     }
 
+    /// Device block ids of the request's failed onboarding operations recorded so far; each id
+    /// is returned once.
+    pub fn take_failed_block_ids(&mut self, request_id: &str) -> Vec<usize> {
+        match self.slots.get(request_id) {
+            Some(slot) => std::mem::take(
+                &mut *slot
+                    .failed_block_ids
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            None => Vec::new(),
+        }
+    }
+
     /// Clone the scheduler channel for async use.
     pub fn get_scheduler_tx(&self) -> mpsc::UnboundedSender<SchedulerMessage> {
         self.scheduler_tx.clone()
@@ -302,6 +324,10 @@ pub struct Scheduler {
     // Note: this does not require a slot to exist yet
     unprocessed_immediate_results: HashMap<String, HashSet<uuid::Uuid>>,
 
+    // Device block ids of failed immediate (onboarding) transfers that completed before their
+    // slot was created; applied to the slot like `unprocessed_immediate_results`.
+    unprocessed_immediate_failures: HashMap<String, Vec<usize>>,
+
     // This object coordinates the two-stage execution of a scheduled transfer request.
     // If the scheduled request arrives first, the controller object will be Some; otherwise,
     // the worker-side request arrived first and it will be None.
@@ -330,6 +356,7 @@ impl Scheduler {
                 slots: HashMap::new(),
                 cancel_tokens: HashMap::new(),
                 unprocessed_immediate_results: HashMap::new(),
+                unprocessed_immediate_failures: HashMap::new(),
                 enqueued_requests: HashMap::new(),
                 worker_rx: scheduler_rx,
                 transfer_rx,
@@ -412,7 +439,16 @@ impl Scheduler {
 
         let slot = SchedulerSlot {
             completed: req.completed,
+            failed_block_ids: req.failed_block_ids,
         };
+
+        // Failures of buffered results are recorded before their completions are counted.
+        if let Some(failed) = self.unprocessed_immediate_failures.get(&request_id) {
+            slot.failed_block_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(failed.iter().copied());
+        }
 
         // Check for buffered ImmediateTransferResults that arrived before the slot was created.
         // Apply buffered count to this worker's slot.
@@ -431,7 +467,7 @@ impl Scheduler {
             // Use num_buffered (not expected_immediate_ops) because we only mark operations
             // as complete that have actually completed. Remaining results will arrive later
             // via handle_immediate_result() and increment the counter then.
-            slot.completed.fetch_add(num_buffered, Ordering::Relaxed);
+            slot.completed.fetch_add(num_buffered, Ordering::Release);
         }
 
         self.slots.insert(request_id, slot);
@@ -451,6 +487,7 @@ impl Scheduler {
         // In TP>1, buffered results are NOT removed in add_slot (they're applied to ALL workers).
         // Clean them up here when the request is finished.
         self.unprocessed_immediate_results.remove(&request_id);
+        self.unprocessed_immediate_failures.remove(&request_id);
 
         tracing::debug!(
             request_id,
@@ -508,9 +545,29 @@ impl Scheduler {
 
     #[tracing::instrument(level = "debug", skip_all, fields(request_id = %result.request_id, operation_id = %result.uuid))]
     fn handle_immediate_result(&mut self, result: ImmediateTransferResult) {
+        // A failed operation still completes (the request must be able to finish); the device
+        // blocks it should have filled are recorded so the worker can report them.
+        let failed_block_ids = match &result.status {
+            Ok(()) => Vec::new(),
+            Err(error) => match error.downcast_ref::<TransferBlocksFailed>() {
+                Some(failure) => failure.block_ids.clone(),
+                None => {
+                    tracing::error!(
+                        "immediate transfer failed without device block ids: {error:#}"
+                    );
+                    Vec::new()
+                }
+            },
+        };
         match self.slots.get_mut(&result.request_id) {
             Some(slot) => {
-                slot.completed.fetch_add(1, Ordering::Relaxed);
+                if !failed_block_ids.is_empty() {
+                    slot.failed_block_ids
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend(failed_block_ids);
+                }
+                slot.completed.fetch_add(1, Ordering::Release);
                 tracing::debug!(
                     "matched slot; incrementing completed counter to {}",
                     slot.completed.load(Ordering::Relaxed)
@@ -518,6 +575,12 @@ impl Scheduler {
             }
             None => {
                 tracing::debug!("no slot found; adding to unprocessed immediate results");
+                if !failed_block_ids.is_empty() {
+                    self.unprocessed_immediate_failures
+                        .entry(result.request_id.clone())
+                        .or_default()
+                        .extend(failed_block_ids);
+                }
                 self.unprocessed_immediate_results
                     .entry(result.request_id)
                     .or_default()
@@ -692,10 +755,13 @@ pub struct SchedulerCreateSlotDetails {
     pub completed: Arc<AtomicU64>,
     /// Expected number of immediate (onboard) operations for this slot.
     pub expected_immediate_ops: u64,
+    /// Filled with the device block ids of failed immediate (onboard) operations.
+    pub failed_block_ids: FailedBlockIds,
 }
 
 pub struct SchedulerSlot {
     completed: Arc<AtomicU64>,
+    failed_block_ids: FailedBlockIds,
 }
 
 pub trait TaskScheduler {
@@ -1145,5 +1211,124 @@ mod tests {
         scheduler_result.await.unwrap().unwrap();
         // after the scheduler completes, the completed counter should be 1
         assert_eq!(completed.load(Ordering::Relaxed), 1);
+    }
+
+    fn failed_onboard(block_ids: Vec<usize>) -> anyhow::Result<()> {
+        Err(anyhow::Error::new(TransferBlocksFailed {
+            block_ids,
+            reason: "disk read failed".to_string(),
+        }))
+    }
+
+    async fn immediate_handle(
+        transfer_client: &TransferSchedulerClient,
+        request_id: &str,
+        uuid: uuid::Uuid,
+    ) -> Box<dyn TransferCompletionHandle> {
+        transfer_client
+            .clone()
+            .schedule_transfer(LeaderTransferRequest {
+                request_id: request_id.to_string(),
+                uuid,
+                requirement: None,
+                request_type: RequestType::Immediate,
+            })
+            .await
+            .unwrap()
+    }
+
+    fn load(request_id: &str, uuid: uuid::Uuid) -> WorkerTransferRequest {
+        WorkerTransferRequest {
+            request_id: request_id.to_string(),
+            uuid,
+            transfer_type: TransferType::Load,
+            request_type: RequestType::Immediate,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_onboarding_completes_and_records_its_block_ids() {
+        let (mut scheduler, mut worker_client, transfer_client) =
+            Scheduler::new(CancellationToken::new());
+        let operation_id = uuid::Uuid::new_v4();
+        worker_client
+            .create_slot_with_immediate_ops("req".to_string(), 1)
+            .unwrap();
+        scheduler.step().await;
+        worker_client.enqueue_request(load("req", operation_id));
+
+        let handle = immediate_handle(&transfer_client, "req", operation_id).await;
+        handle.mark_complete(failed_onboard(vec![7, 8, 9])).await;
+        scheduler.step().await;
+
+        // A failed operation still completes, so the request can be reported as finished.
+        assert!(worker_client.is_complete("req"));
+        assert_eq!(worker_client.take_failed_block_ids("req"), vec![7, 8, 9]);
+        // Each id is reported once.
+        assert!(worker_client.take_failed_block_ids("req").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failure_arriving_before_the_slot_is_applied_to_it() {
+        let (mut scheduler, mut worker_client, transfer_client) =
+            Scheduler::new(CancellationToken::new());
+        let operation_id = uuid::Uuid::new_v4();
+
+        let handle = immediate_handle(&transfer_client, "req", operation_id).await;
+        handle.mark_complete(failed_onboard(vec![3])).await;
+        scheduler.step().await;
+
+        worker_client
+            .create_slot_with_immediate_ops("req".to_string(), 1)
+            .unwrap();
+        scheduler.step().await;
+        worker_client.enqueue_request(load("req", operation_id));
+
+        assert!(worker_client.is_complete("req"));
+        assert_eq!(worker_client.take_failed_block_ids("req"), vec![3]);
+
+        worker_client.remove_slot(&"req".to_string());
+        scheduler.step().await;
+        assert!(scheduler.unprocessed_immediate_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_onboarding_records_no_failures() {
+        let (mut scheduler, mut worker_client, transfer_client) =
+            Scheduler::new(CancellationToken::new());
+        let operation_id = uuid::Uuid::new_v4();
+        worker_client
+            .create_slot_with_immediate_ops("req".to_string(), 1)
+            .unwrap();
+        scheduler.step().await;
+        worker_client.enqueue_request(load("req", operation_id));
+
+        let handle = immediate_handle(&transfer_client, "req", operation_id).await;
+        handle.mark_complete(Ok(())).await;
+        scheduler.step().await;
+
+        assert!(worker_client.is_complete("req"));
+        assert!(worker_client.take_failed_block_ids("req").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failure_without_block_ids_still_completes_the_operation() {
+        let (mut scheduler, mut worker_client, transfer_client) =
+            Scheduler::new(CancellationToken::new());
+        let operation_id = uuid::Uuid::new_v4();
+        worker_client
+            .create_slot_with_immediate_ops("req".to_string(), 1)
+            .unwrap();
+        scheduler.step().await;
+        worker_client.enqueue_request(load("req", operation_id));
+
+        let handle = immediate_handle(&transfer_client, "req", operation_id).await;
+        handle
+            .mark_complete(Err(anyhow::anyhow!("transfer failed")))
+            .await;
+        scheduler.step().await;
+
+        assert!(worker_client.is_complete("req"));
+        assert!(worker_client.take_failed_block_ids("req").is_empty());
     }
 }

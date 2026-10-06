@@ -150,3 +150,82 @@ where
         Ok(Box::new(std::future::ready(())))
     }
 }
+
+/// Status poll interval of [`read_disk_blocks_into_host`]. Completion is noticed up to one
+/// interval late, which is added to the measured disk-read time.
+const DISK_READ_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Read disk blocks into host blocks with NIXL; the receiver yields the transfer's result.
+///
+/// The POSIX backend needs the host-memory list as the local descriptor list for reads as well
+/// as writes (`kvbm-physical` calls this `NixlReadFlipped`), so the lists are swapped relative to
+/// [`write_blocks_to`]. Unlike [`write_blocks_to`], a failed status poll is returned as an error
+/// instead of being treated as completion. The poll runs as its own task, so the NIXL request
+/// stays alive until the read has finished even if the caller stops waiting.
+pub fn read_disk_blocks_into_host<Source, Destination>(
+    src: &[Source],
+    dst: &mut [Destination],
+    ctx: &Arc<TransferContext>,
+) -> Result<oneshot::Receiver<Result<()>>>
+where
+    Source: BlockDataProvider,
+    Source::StorageType: NixlDescriptor,
+    Destination: BlockDataProviderMut,
+    Destination::StorageType: NixlDescriptor,
+{
+    let (tx, rx) = oneshot::channel();
+    if src.is_empty() && dst.is_empty() {
+        let _ = tx.send(Ok(()));
+        return Ok(rx);
+    }
+    if src.len() != dst.len() {
+        anyhow::bail!(
+            "disk read has {} sources but {} destinations",
+            src.len(),
+            dst.len()
+        );
+    }
+
+    let nixl_agent_arc = ctx.as_ref().nixl_agent();
+    let nixl_agent = nixl_agent_arc
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("NIXL agent not found"))?;
+
+    let src_mem_type = src[0].block_data().storage_type().nixl_mem_type();
+    let dst_mem_type = dst[0].block_data().storage_type().nixl_mem_type();
+    let mut src_dl = XferDescList::new(src_mem_type)?;
+    let mut dst_dl = XferDescList::new(dst_mem_type)?;
+    for (src, dst) in src.iter().zip(dst.iter_mut()) {
+        append_xfer_request(src, dst, &mut src_dl, &mut dst_dl)?;
+    }
+
+    // Host memory is the local list and the file the remote list; READ moves remote -> local.
+    let xfer_req = nixl_agent.create_xfer_req(
+        nixl_sys::XferOp::Read,
+        &dst_dl,
+        &src_dl,
+        &nixl_agent.name(),
+        None,
+    )?;
+    if !nixl_agent.post_xfer_req(&xfer_req, None)? {
+        let _ = tx.send(Ok(()));
+        return Ok(rx);
+    }
+
+    ctx.async_rt_handle().spawn(async move {
+        let result = match nixl_agent_arc.as_ref().as_ref() {
+            None => Err(anyhow::anyhow!("NIXL agent not found")),
+            Some(agent) => loop {
+                match agent.get_xfer_status(&xfer_req) {
+                    Ok(XferStatus::Success) => break Ok(()),
+                    Ok(XferStatus::InProgress) => tokio::time::sleep(DISK_READ_POLL_INTERVAL).await,
+                    Err(error) => break Err(anyhow::anyhow!("NIXL disk read failed: {error}")),
+                }
+            },
+        };
+        drop(xfer_req);
+        let _ = tx.send(result);
+    });
+    Ok(rx)
+}

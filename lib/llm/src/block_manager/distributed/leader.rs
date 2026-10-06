@@ -204,6 +204,26 @@ impl KvbmLeader {
         zmq.broadcast(ZMQ_TRANSFER_BLOCKS_MESSAGE, data).await
     }
 
+    /// Like [`Self::transfer_blocks_request`], but the completion reports whether every worker
+    /// actually completed the transfer instead of only that every worker answered.
+    pub async fn transfer_blocks_request_checked(
+        &self,
+        request: BlockTransferRequest,
+    ) -> anyhow::Result<TransferCompletion> {
+        let zmq = self
+            .zmq_leader
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("ZMQ leader not ready"))?;
+        let data = vec![serde_json::to_vec(&request)?];
+        let payloads = zmq
+            .broadcast_with_payloads(ZMQ_TRANSFER_BLOCKS_MESSAGE, data)
+            .await?;
+        Ok(TransferCompletion {
+            payloads,
+            num_workers: self.config.world_size,
+        })
+    }
+
     pub fn num_device_blocks(&self) -> usize {
         self.state.num_device_blocks.load(Ordering::Acquire)
     }
@@ -225,5 +245,66 @@ impl KvbmLeader {
             _ = notified => true,
             _ = sleep(Duration::from_secs(self.config.leader_init_timeout_secs)) => false,
         }
+    }
+}
+
+/// Completion of a transfer sent with [`KvbmLeader::transfer_blocks_request_checked`].
+pub struct TransferCompletion {
+    payloads: oneshot::Receiver<Vec<Vec<u8>>>,
+    num_workers: usize,
+}
+
+impl TransferCompletion {
+    /// Wait until every worker answered. Ok only if every worker reported a completed transfer.
+    pub async fn wait(self) -> anyhow::Result<()> {
+        let payloads = self.payloads.await.map_err(|_| {
+            anyhow::anyhow!("transfer completion was dropped before every worker replied")
+        })?;
+        transfer_outcomes_result(&payloads, self.num_workers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(result: anyhow::Result<()>) -> Vec<u8> {
+        TransferOutcome::from_result(&result).encode()
+    }
+
+    fn completion(num_workers: usize) -> (oneshot::Sender<Vec<Vec<u8>>>, TransferCompletion) {
+        let (tx, payloads) = oneshot::channel();
+        (
+            tx,
+            TransferCompletion {
+                payloads,
+                num_workers,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn completion_is_ok_when_every_worker_succeeded() {
+        let (tx, completion) = completion(2);
+        tx.send(vec![outcome(Ok(())), outcome(Ok(()))]).unwrap();
+        completion.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_reports_a_worker_failure() {
+        let (tx, completion) = completion(1);
+        tx.send(vec![outcome(Err(anyhow::anyhow!(
+            "createXferReq: no potential backend found"
+        )))])
+        .unwrap();
+        let error = completion.wait().await.unwrap_err();
+        assert!(format!("{error:#}").contains("no potential backend"));
+    }
+
+    #[tokio::test]
+    async fn completion_fails_when_the_leader_stops_waiting() {
+        let (tx, completion) = completion(1);
+        drop(tx);
+        assert!(completion.wait().await.is_err());
     }
 }

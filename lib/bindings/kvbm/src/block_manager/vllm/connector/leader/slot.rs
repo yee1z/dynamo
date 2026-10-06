@@ -2149,9 +2149,13 @@ async fn process_onboard_request(
             block_count
         );
     }
-    let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
+    // The checked completion carries each worker's transfer result, so a failed read is
+    // reported as an error here instead of as a completed transfer.
+    let completion = leader
+        .transfer_blocks_request_checked(block_xfer_req)
+        .await?;
 
-    let result = notify_receiver.await;
+    let result = completion.wait().await;
     if m1_trace_enabled() {
         let status = if result.is_ok() { "ok" } else { "error" };
         let canonical_id = canonical_request_id(request_id);
@@ -2176,10 +2180,11 @@ async fn process_onboard_request(
         Ok(_) => {
             tracing::debug!("Onboarding transfer completed successfully");
         }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "Onboarding transfer completion notification failed"
-            ));
+        Err(error) => {
+            return Err(error.context(format!(
+                "onboarding transfer {operation_id} ({direction}, {block_count} blocks) for \
+                 request {request_id} failed"
+            )));
         }
     }
 
