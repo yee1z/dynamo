@@ -40,3 +40,47 @@ def test_only_fixed_messages_are_accepted() -> None:
     payload = phase_c_nvtx.make_payload(REQUEST_ID)
     with pytest.raises(ValueError, match="not a Phase C range"):
         phase_c_nvtx.start_range(f"prefill:{REQUEST_ID}", payload)
+
+
+def test_worker_request_received_event_schema() -> None:
+    event = phase_c_nvtx.worker_request_received_event(
+        f"chatcmpl-{REQUEST_ID}",
+        ts_ns=123,
+        worker_id=7587,
+        dp_rank=0,
+        prompt_tokens=5,
+        fpm_worker_id="w0",
+    )
+    assert event == {
+        "schema": 1,
+        "ts_ns": 123,
+        "request_id": REQUEST_ID,
+        "handler_request_id": f"chatcmpl-{REQUEST_ID}",
+        "component": "vllm_handler",
+        "event": "worker_request_received",
+        "worker_id": 7587,
+        "dp_rank": 0,
+        "fpm_worker_id": "w0",
+        "prompt_tokens": 5,
+        "clock": "CLOCK_MONOTONIC",
+        "request_key": 1_893_824_137_375_840_644,
+        "request_key_hex": "1a483704df58f984",
+        "transfer_key": 0,
+        "transfer_key_hex": "0000000000000000",
+    }
+
+
+def test_worker_request_received_requires_canonical_uuid() -> None:
+    assert (
+        phase_c_nvtx.worker_request_received_event(
+            "req-1", ts_ns=1, worker_id=None, dp_rank=None, prompt_tokens=None
+        )
+        is None
+    )
+
+
+def test_prompt_token_count() -> None:
+    assert phase_c_nvtx.prompt_token_count({"token_ids": [1, 2, 3]}) == 3
+    assert phase_c_nvtx.prompt_token_count({"messages": []}) is None
+    assert phase_c_nvtx.prompt_token_count({"token_ids": "abc"}) is None
+    assert phase_c_nvtx.prompt_token_count(None) is None

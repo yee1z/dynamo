@@ -29,6 +29,56 @@ use dynamo_kv_router::{
     },
 };
 
+/// Emit one `DYN_PHASE_D_STATE_EVENT` per applied KV event (trace mode only).
+fn state_event_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
+}
+
+/// Identity of one KV event as the router applies it. Stored blocks keep both
+/// the external (engine) hash and the router's local hash, plus the parent, so
+/// an offline analyzer can rebuild each block's prefix chain and match it with
+/// a router decision's `predicted_local_hashes`.
+fn state_event_trace(event: &RouterEvent, source: &str) -> serde_json::Value {
+    let (op, parent_hash, stored_blocks, removed_hashes) = match &event.event.data {
+        KvCacheEventData::Stored(store) => (
+            "stored",
+            store.parent_hash.map(|hash| hash.0),
+            store
+                .blocks
+                .iter()
+                .map(|block| [block.block_hash.0, block.tokens_hash.0])
+                .collect::<Vec<_>>(),
+            Vec::new(),
+        ),
+        KvCacheEventData::Removed(remove) => (
+            "removed",
+            None,
+            Vec::new(),
+            remove.block_hashes.iter().map(|hash| hash.0).collect(),
+        ),
+        KvCacheEventData::Cleared => ("cleared", None, Vec::new(), Vec::new()),
+    };
+    serde_json::json!({
+        "schema": 1,
+        "source": source,
+        "worker_id": event.worker_id,
+        "dp_rank": event.event.dp_rank,
+        "event_id": event.event.event_id,
+        "storage_tier": format!("{:?}", event.storage_tier),
+        "op": op,
+        "parent_hash": parent_hash,
+        "stored_blocks": stored_blocks,
+        "removed_hashes": removed_hashes,
+    })
+}
+
+fn log_state_event(mut trace: serde_json::Value, applied: bool) {
+    trace["applied"] = serde_json::Value::Bool(applied);
+    trace["router_apply_ns"] = serde_json::Value::from(crate::kv_router::monotonic_ns());
+    tracing::info!("DYN_PHASE_D_STATE_EVENT {trace}");
+}
+
 #[cfg(test)]
 use super::worker_query_state::RankState;
 #[cfg(test)]
@@ -505,7 +555,12 @@ impl WorkerQueryClient {
             "Applying clear barrier for worker {worker_id}; invalidating recovery across {} dp_ranks",
             worker_state.ranks.len()
         );
-        self.indexer.apply_event(event).await
+        let trace = state_event_trace_enabled().then(|| state_event_trace(&event, "recovery"));
+        let applied = self.indexer.apply_event(event).await;
+        if let Some(trace) = trace {
+            log_state_event(trace, applied);
+        }
+        applied
     }
 
     async fn apply_tree_dump_replace_locked(
@@ -519,7 +574,12 @@ impl WorkerQueryClient {
             return false;
         }
         for event in events {
-            if !self.indexer.apply_event(event).await {
+            let trace = state_event_trace_enabled().then(|| state_event_trace(&event, "tree_dump"));
+            let applied = self.indexer.apply_event(event).await;
+            if let Some(trace) = trace {
+                log_state_event(trace, applied);
+            }
+            if !applied {
                 return false;
             }
         }
@@ -548,7 +608,13 @@ impl WorkerQueryClient {
                         event.event.event_id.saturating_add(1),
                         Self::state_digest(&event),
                     );
-                    if !self.indexer.apply_event(event).await {
+                    let trace =
+                        state_event_trace_enabled().then(|| state_event_trace(&event, "live"));
+                    let applied = self.indexer.apply_event(event).await;
+                    if let Some(trace) = trace {
+                        log_state_event(trace, applied);
+                    }
+                    if !applied {
                         self.mark_propagation_failure(worker_id, dp_rank);
                         return;
                     }
@@ -574,7 +640,12 @@ impl WorkerQueryClient {
                 let summary_digest = Self::state_digest(&event);
                 let fence = self.event_fence(&event).await;
                 self.begin_state_update(worker_id, dp_rank, fence);
-                if !self.indexer.apply_event(event).await {
+                let trace = state_event_trace_enabled().then(|| state_event_trace(&event, "live"));
+                let applied = self.indexer.apply_event(event).await;
+                if let Some(trace) = trace {
+                    log_state_event(trace, applied);
+                }
+                if !applied {
                     self.mark_propagation_failure(worker_id, dp_rank);
                     return;
                 }
@@ -736,7 +807,13 @@ impl WorkerQueryClient {
                         new_cursor = new_cursor.apply_barrier(event_id);
                         continue;
                     }
-                    if !self.indexer.apply_event(event).await {
+                    let trace =
+                        state_event_trace_enabled().then(|| state_event_trace(&event, "recovery"));
+                    let event_applied = self.indexer.apply_event(event).await;
+                    if let Some(trace) = trace {
+                        log_state_event(trace, event_applied);
+                    }
+                    if !event_applied {
                         applied = false;
                         break;
                     }
@@ -957,6 +1034,91 @@ impl WorkerQueryClient {
 
         Err(last_error
             .unwrap_or_else(|| anyhow::anyhow!("No response after {RECOVERY_MAX_RETRIES} retries")))
+    }
+}
+
+#[cfg(test)]
+mod state_event_trace_tests {
+    use super::*;
+    use dynamo_kv_router::protocols::{
+        ExternalSequenceBlockHash, KvCacheEvent, KvCacheRemoveData, KvCacheStoreData,
+        KvCacheStoredBlockData, LocalBlockHash, StorageTier,
+    };
+
+    fn router_event(data: KvCacheEventData, tier: StorageTier) -> RouterEvent {
+        RouterEvent::with_storage_tier(
+            7,
+            KvCacheEvent {
+                event_id: 41,
+                data,
+                dp_rank: 0,
+            },
+            tier,
+        )
+    }
+
+    #[test]
+    fn stored_event_keeps_external_local_and_parent_hashes() {
+        let event = router_event(
+            KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: Some(ExternalSequenceBlockHash(100)),
+                start_position: None,
+                blocks: vec![
+                    KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(101),
+                        tokens_hash: LocalBlockHash(11),
+                        mm_extra_info: None,
+                    },
+                    KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(102),
+                        tokens_hash: LocalBlockHash(12),
+                        mm_extra_info: None,
+                    },
+                ],
+            }),
+            StorageTier::Device,
+        );
+        let trace = state_event_trace(&event, "live");
+        assert_eq!(trace["op"], "stored");
+        assert_eq!(trace["source"], "live");
+        assert_eq!(trace["worker_id"], 7);
+        assert_eq!(trace["event_id"], 41);
+        assert_eq!(trace["storage_tier"], "Device");
+        assert_eq!(trace["parent_hash"], 100);
+        assert_eq!(
+            trace["stored_blocks"],
+            serde_json::json!([[101, 11], [102, 12]])
+        );
+        assert_eq!(trace["removed_hashes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn removed_and_cleared_events_are_identified() {
+        let removed = router_event(
+            KvCacheEventData::Removed(KvCacheRemoveData {
+                block_hashes: vec![ExternalSequenceBlockHash(101)],
+            }),
+            StorageTier::HostPinned,
+        );
+        let trace = state_event_trace(&removed, "recovery");
+        assert_eq!(trace["op"], "removed");
+        assert_eq!(trace["storage_tier"], "HostPinned");
+        assert_eq!(trace["removed_hashes"], serde_json::json!([101]));
+        assert!(trace["parent_hash"].is_null());
+
+        let cleared = router_event(KvCacheEventData::Cleared, StorageTier::Device);
+        assert_eq!(state_event_trace(&cleared, "live")["op"], "cleared");
+    }
+
+    #[test]
+    fn logged_event_records_apply_result_and_monotonic_time() {
+        let mut trace = state_event_trace(
+            &router_event(KvCacheEventData::Cleared, StorageTier::Device),
+            "live",
+        );
+        trace["applied"] = serde_json::Value::Bool(false);
+        trace["router_apply_ns"] = serde_json::Value::from(crate::kv_router::monotonic_ns());
+        assert!(trace["router_apply_ns"].as_u64().unwrap() > 0);
     }
 }
 

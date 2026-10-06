@@ -1740,3 +1740,74 @@ class TestM2SpeculativeOnboardingControl:
         assert responses[0]["disposition"] == "rejected"
         assert responses[0]["reason"] == "worker_id_mismatch"
         open_socket.assert_not_awaited()
+
+
+# ── E1 worker_request_received trace ───────────────────────────────
+
+TRACE_REQUEST_ID = "369a1572-4253-4632-bfc6-39631d9c98e9"
+
+
+def _trace_events(info_mock) -> list[dict]:
+    return [
+        json.loads(call.args[1])
+        for call in info_mock.call_args_list
+        if call.args and call.args[0] == "DYN_M1_TRACE %s"
+    ]
+
+
+@pytest.mark.asyncio(loop_scope="function")
+class TestWorkerRequestReceivedTrace:
+    async def _run(self, handler, request):
+        order: list[str] = []
+
+        async def fake_token_mode(req, ctx, request_id):
+            order.append("engine_path")
+            yield {"token_ids": [1]}
+
+        handler.use_vllm_tokenizer = False
+        handler._generate_token_mode = fake_token_mode
+        context = MagicMock()
+        context.id.return_value = TRACE_REQUEST_ID
+        with patch.object(mod.logger, "info") as info:
+            info.side_effect = lambda *args, **kwargs: order.append("trace")
+            chunks = [chunk async for chunk in handler.generate(request, context)]
+        return chunks, order, info
+
+    async def test_generate_emits_before_engine_path(self, monkeypatch):
+        monkeypatch.setenv("DYN_M1_TRACE", "1")
+        monkeypatch.setenv("DYN_FPM_WORKER_ID", "w0")
+        handler = _make_decode_handler()
+        handler.generate_endpoint = MagicMock()
+        handler.generate_endpoint.connection_id.return_value = 7587
+        request = {"token_ids": [1, 2, 3, 4], "routing": {"dp_rank": 0}}
+        chunks, order, info = await self._run(handler, request)
+
+        assert chunks == [{"token_ids": [1]}]
+        assert order[:2] == ["trace", "engine_path"]
+        events = _trace_events(info)
+        assert len(events) == 1
+        event = events[0]
+        assert event["event"] == "worker_request_received"
+        assert event["request_id"] == TRACE_REQUEST_ID
+        assert event["worker_id"] == 7587
+        assert event["dp_rank"] == 0
+        assert event["fpm_worker_id"] == "w0"
+        assert event["prompt_tokens"] == 4
+        assert isinstance(event["ts_ns"], int) and event["ts_ns"] > 0
+
+    async def test_generate_is_silent_without_trace_mode(self, monkeypatch):
+        monkeypatch.delenv("DYN_M1_TRACE", raising=False)
+        handler = _make_decode_handler()
+        handler.generate_endpoint = MagicMock()
+        _, order, info = await self._run(handler, {"token_ids": [1]})
+        assert _trace_events(info) == []
+        assert order == ["engine_path"]
+
+    async def test_trace_never_breaks_serving(self, monkeypatch):
+        monkeypatch.setenv("DYN_M1_TRACE", "1")
+        handler = _make_decode_handler()
+        handler.generate_endpoint = MagicMock()
+        handler.generate_endpoint.connection_id.side_effect = RuntimeError("gone")
+        chunks, _, info = await self._run(handler, {"token_ids": [1]})
+        assert chunks == [{"token_ids": [1]}]
+        assert _trace_events(info)[0]["worker_id"] is None

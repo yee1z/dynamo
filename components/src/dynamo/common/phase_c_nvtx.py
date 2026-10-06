@@ -146,6 +146,50 @@ def trace_keys(request_id: str, transfer_id: str | None = None) -> dict[str, int
     }
 
 
+def prompt_token_count(request: object) -> int | None:
+    """Return the prompt length of a token-mode request, or None if unknown."""
+    if not isinstance(request, dict):
+        return None
+    token_ids = request.get("token_ids")
+    return len(token_ids) if isinstance(token_ids, list) else None
+
+
+def worker_request_received_event(
+    request_id: str,
+    *,
+    ts_ns: int,
+    worker_id: int | None,
+    dp_rank: int | None,
+    prompt_tokens: int | None,
+    fpm_worker_id: str = "",
+) -> dict[str, object] | None:
+    """Build the E1 handler-arrival event, or None without a canonical UUID.
+
+    ``ts_ns`` is ``time.monotonic_ns()`` (CLOCK_MONOTONIC), the same clock as
+    the router and scheduler events, so intervals across processes on one host
+    are directly comparable. ``worker_id`` is the endpoint instance id that the
+    router reports as its ``worker_id``.
+    """
+    try:
+        canonical = canonical_uuid(request_id)
+    except ValueError:
+        return None
+    return {
+        "schema": 1,
+        "ts_ns": ts_ns,
+        "request_id": canonical,
+        "handler_request_id": request_id,
+        "component": "vllm_handler",
+        "event": "worker_request_received",
+        "worker_id": worker_id,
+        "dp_rank": dp_rank,
+        "fpm_worker_id": fpm_worker_id,
+        "prompt_tokens": prompt_tokens,
+        "clock": "CLOCK_MONOTONIC",
+        **trace_keys(canonical),
+    }
+
+
 def start_range(message: str, payload: Payload):
     category = RANGE_CATEGORIES.get(message)
     if category is None:

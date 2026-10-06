@@ -46,6 +46,7 @@ from vllm.sampling_params import (
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from dynamo._core import Context
+from dynamo.common import phase_c_nvtx
 from dynamo.common.backend import logprobs as _shared_logprobs
 from dynamo.common.lora.manager import LoRAInfo, get_lora_manager
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
@@ -3353,6 +3354,34 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             self.runtime.shutdown()
             os._exit(1)
 
+    def _trace_worker_request_received(
+        self, request, request_id: str, received_ns: int
+    ) -> None:
+        """Emit the E1 ``worker_request_received`` event in trace mode only.
+
+        Called before any request processing or engine submission. Tracing must
+        never fail a request, so identity lookups degrade to ``None``.
+        """
+        if "DYN_M1_TRACE" not in os.environ:
+            return
+        routing = request.get("routing") if isinstance(request, dict) else None
+        dp_rank = routing.get("dp_rank") if isinstance(routing, dict) else None
+        endpoint = getattr(self, "generate_endpoint", None)
+        try:
+            worker_id = endpoint.connection_id() if endpoint is not None else None
+        except Exception:  # noqa: BLE001 - tracing is best-effort by design
+            worker_id = None
+        event = phase_c_nvtx.worker_request_received_event(
+            request_id,
+            ts_ns=received_ns,
+            worker_id=worker_id,
+            dp_rank=dp_rank,
+            prompt_tokens=phase_c_nvtx.prompt_token_count(request),
+            fpm_worker_id=os.environ.get("DYN_FPM_WORKER_ID", ""),
+        )
+        if event is not None:
+            logger.info("DYN_M1_TRACE %s", json.dumps(event, separators=(",", ":")))
+
 
 class DecodeWorkerHandler(BaseWorkerHandler):
     def __init__(
@@ -3386,8 +3415,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         )
 
     async def generate(self, request, context):
+        received_ns = time.monotonic_ns()
         # Use context ID for request tracking and correlation
         request_id = context.id()
+        self._trace_worker_request_received(request, request_id, received_ns)
         logger.debug(f"Decode Request ID: {request_id}")
         first_token = True
         with time_and_log_code_section(

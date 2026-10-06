@@ -46,6 +46,33 @@ fn phase_d_state_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DYN_PHASE_D_STATE_TRACE").is_some())
 }
 
+/// Keep a copy of the request's local block hashes only when a trace that
+/// reports them is enabled. Routing never reads this copy.
+fn trace_block_hashes(
+    trace_enabled: bool,
+    block_hashes: Option<&Vec<LocalBlockHash>>,
+) -> Option<Vec<LocalBlockHash>> {
+    if trace_enabled {
+        block_hashes.filter(|hashes| !hashes.is_empty()).cloned()
+    } else {
+        None
+    }
+}
+
+/// Local block hashes of the predicted reusable prefix, for joining a router
+/// decision with later KV store/remove events of the same blocks.
+fn predicted_local_hashes(
+    trace_block_hashes: Option<&[LocalBlockHash]>,
+    predicted_blocks: u32,
+) -> Vec<u64> {
+    trace_block_hashes
+        .unwrap_or_default()
+        .iter()
+        .take(predicted_blocks as usize)
+        .map(|hash| hash.0)
+        .collect()
+}
+
 fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -101,6 +128,8 @@ struct QueuedRequest {
     request: SchedulingRequest,
     enqueue_at: Instant,
     block_hashes: Option<Vec<LocalBlockHash>>,
+    /// Trace-only copy of the request's local block hashes; never used for routing.
+    trace_block_hashes: Option<Vec<LocalBlockHash>>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -108,6 +137,7 @@ enum AdmissionCommand {
     Enqueue {
         request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        trace_block_hashes: Option<Vec<LocalBlockHash>>,
         ack_tx: oneshot::Sender<()>,
     },
     Update {
@@ -408,9 +438,14 @@ impl<
         }
 
         let (ack_tx, ack_rx) = oneshot::channel();
+        let trace_block_hashes = trace_block_hashes(
+            m1_trace_enabled() || phase_d_state_trace_enabled(),
+            block_hashes.as_ref(),
+        );
         let command = AdmissionCommand::Enqueue {
             request,
             block_hashes: self.prepare_block_hashes_for_refresh(block_hashes),
+            trace_block_hashes,
             ack_tx,
         };
 
@@ -493,9 +528,10 @@ impl<
                 AdmissionCommand::Enqueue {
                     request,
                     block_hashes,
+                    trace_block_hashes,
                     ack_tx,
                 } => {
-                    self.handle_enqueue(request, block_hashes);
+                    self.handle_enqueue(request, block_hashes, trace_block_hashes);
                     let _ = ack_tx.send(());
                 }
                 AdmissionCommand::Update { ack_tx } => {
@@ -530,6 +566,7 @@ impl<
         &mut self,
         request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        trace_block_hashes: Option<Vec<LocalBlockHash>>,
     ) {
         let eligibility = request.eligibility();
         let decay_now = Instant::now();
@@ -558,7 +595,7 @@ impl<
             (class_index, Some(snapshot), should_queue)
         };
         if !should_queue {
-            self.admit_one(request, decay_now);
+            self.admit_one(request, decay_now, trace_block_hashes.as_deref());
             return;
         }
 
@@ -572,6 +609,7 @@ impl<
             request,
             enqueue_at: decay_now,
             block_hashes,
+            trace_block_hashes,
         };
         let worker_count = self.workers_with_configs.borrow().len();
         if let Err((rejection, queued)) = self.pending.enqueue(
@@ -689,18 +727,27 @@ impl<
             let admit_now = Instant::now();
             let class_index = popped.class_index();
             let class = self.profile.class(class_index);
-            let request = popped.into_payload().request;
+            let queued = popped.into_payload();
             tracing::debug!(
                 policy_class = class.name,
                 "scheduling request from pending queue"
             );
-            self.admit_one(request, admit_now);
+            self.admit_one(
+                queued.request,
+                admit_now,
+                queued.trace_block_hashes.as_deref(),
+            );
         }
     }
 
     /// Run the full scheduling pipeline for a single request:
     /// compute projected load -> select worker -> book tracked state -> respond.
-    fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
+    fn admit_one(
+        &self,
+        mut request: SchedulingRequest,
+        decay_now: Instant,
+        trace_block_hashes: Option<&[LocalBlockHash]>,
+    ) {
         #[cfg(feature = "phase-c-nvtx")]
         let phase_c_router_range =
             request
@@ -799,13 +846,15 @@ impl<
                     .take(predicted_blocks as usize)
                     .copied()
                     .collect::<Vec<_>>();
+                let predicted_local_hashes =
+                    predicted_local_hashes(trace_block_hashes, predicted_blocks);
                 let disposition = qualify_lower_tier_prediction(state, lower_tier_blocks as usize);
                 #[cfg(feature = "phase-c-nvtx")]
                 {
                     let canonical_id = canonical_request_id(request_id);
                     let request_key = nvtx::request_key(canonical_id).unwrap_or(0);
                     tracing::info!(
-                        "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_block_ids\":{:?},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
+                        "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"request_key\":{},\"request_key_hex\":{:?},\"transfer_key\":0,\"transfer_key_hex\":\"0000000000000000\",\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_block_ids\":{:?},\"predicted_local_hashes\":{:?},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
                         monotonic_ns(),
                         canonical_id,
                         request_key,
@@ -815,6 +864,7 @@ impl<
                         predicted_blocks.saturating_mul(self.block_size),
                         predicted_blocks,
                         predicted_block_ids,
+                        predicted_local_hashes,
                         predicted_tier,
                         state.status.as_str(),
                         state_version,
@@ -827,7 +877,7 @@ impl<
                 }
                 #[cfg(not(feature = "phase-c-nvtx"))]
                 tracing::info!(
-                    "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_block_ids\":{:?},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
+                    "DYN_M1_TRACE {{\"schema\":2,\"ts_ns\":{},\"request_id\":{:?},\"component\":\"router\",\"event\":\"router_decision\",\"worker_id\":{},\"dp_rank\":{},\"predicted_matched_tokens\":{},\"predicted_matched_blocks\":{},\"predicted_block_ids\":{:?},\"predicted_local_hashes\":{:?},\"predicted_tier\":{:?},\"state_status\":{:?},\"state_version\":{},\"state_age_ms\":{},\"worker_epoch\":{},\"state_confidence\":{:.1},\"fallback_reason\":{:?},\"prediction_disposition\":{:?}}}",
                     monotonic_ns(),
                     canonical_request_id(request_id),
                     response.best_worker.worker_id,
@@ -835,6 +885,7 @@ impl<
                     predicted_blocks.saturating_mul(self.block_size),
                     predicted_blocks,
                     predicted_block_ids,
+                    predicted_local_hashes,
                     predicted_tier,
                     state.status.as_str(),
                     state_version,
@@ -1076,6 +1127,27 @@ mod tests {
 
     fn decay_now() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn trace_block_hashes_are_kept_only_when_tracing() {
+        let hashes = vec![LocalBlockHash(1), LocalBlockHash(2)];
+        assert_eq!(trace_block_hashes(false, Some(&hashes)), None);
+        assert_eq!(
+            trace_block_hashes(true, Some(&hashes)),
+            Some(hashes.clone())
+        );
+        assert_eq!(trace_block_hashes(true, Some(&Vec::new())), None);
+        assert_eq!(trace_block_hashes(true, None), None);
+    }
+
+    #[test]
+    fn predicted_local_hashes_follow_the_predicted_prefix() {
+        let hashes = [LocalBlockHash(7), LocalBlockHash(8), LocalBlockHash(9)];
+        assert_eq!(predicted_local_hashes(Some(&hashes), 2), vec![7, 8]);
+        assert_eq!(predicted_local_hashes(Some(&hashes), 5), vec![7, 8, 9]);
+        assert!(predicted_local_hashes(Some(&hashes), 0).is_empty());
+        assert!(predicted_local_hashes(None, 3).is_empty());
     }
 
     #[test]
